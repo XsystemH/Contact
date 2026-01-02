@@ -42,7 +42,26 @@ class ContactNet(nn.Module):
         )
         
         # 4. Classification MLP Head
-        total_feat_dim = config['model']['total_feat_dim']
+        # Compute expected total feature dim to avoid silent concat mismatches.
+        # Feature order (per-vertex):
+        # visual(384) + xyz_norm(3) + normals(3)
+        # + is_inside_img(1) + is_inside_box(1) + dist_to_center(1) + mask_dist(1)
+        # + pose_embed(32)
+        visual_feat_dim = int(config['model'].get('visual_feat_dim', 384))
+        geometry_feat_dim = int(config['model'].get('geometry_feat_dim', 3))
+        normal_feat_dim = int(config['model'].get('normal_feat_dim', 3))
+        flag_feat_dim = int(config['model'].get('flag_feat_dim', 4))
+        pose_embed_dim = int(config['model'].get('pose_embed_dim', 32))
+
+        computed_total_feat_dim = visual_feat_dim + geometry_feat_dim + normal_feat_dim + flag_feat_dim + pose_embed_dim
+        cfg_total_feat_dim = config['model'].get('total_feat_dim', None)
+        if cfg_total_feat_dim is not None and int(cfg_total_feat_dim) != computed_total_feat_dim:
+            print(
+                f"[ContactNet] WARNING: config model.total_feat_dim={cfg_total_feat_dim} "
+                f"but computed_total_feat_dim={computed_total_feat_dim}. Using computed value."
+            )
+        total_feat_dim = computed_total_feat_dim
+
         hidden_dims = config['model']['hidden_dims']
         dropout = config['model']['dropout']
         
@@ -69,7 +88,7 @@ class ContactNet(nn.Module):
         """Count trainable parameters (excluding frozen backbone)."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
-    def forward(self, images, vertices, normals, pose_params, K, object_bbox):
+    def forward(self, images, vertices, normals, pose_params, K, object_bbox, mask_dist_field):
         """
         Forward pass.
         
@@ -80,6 +99,7 @@ class ContactNet(nn.Module):
             pose_params: (B, 63) - Body pose parameters
             K: (B, 3, 3) - Camera intrinsics
             object_bbox: (B, 4) - Object bounding box
+            mask_dist_field: (B, 1, H, W) - Dilated mask distance field in [0, 1]
             
         Returns:
             logits: (B, N) - Contact logits for each vertex (use sigmoid for probabilities)
@@ -100,13 +120,22 @@ class ContactNet(nn.Module):
         # 3. Sample visual features at projected vertex locations
         visual_feats = self.geometry_processor.sample_features(feature_maps, grid_coords)
         # visual_feats: [B, N, 384] (128 + 256 from layer2 and layer3)
+
+        # 3b. Sample mask distance field at projected vertex locations
+        # NOTE: grid_sample padding is zeros; for distance (0=near), we want out-of-image to be "far" (=1).
+        mask_dist = self.geometry_processor.sample_features([mask_dist_field], grid_coords)  # [B, N, 1]
+        mask_dist = torch.where(
+            geom_feats['is_inside_img'] > 0.5,
+            mask_dist,
+            torch.ones_like(mask_dist)
+        )
         
         # 4. Pose embedding
         pose_embed = self.pose_mlp(pose_params)  # [B, 32]
         pose_embed = pose_embed.unsqueeze(1).expand(-1, N, -1)  # [B, N, 32]
         
         # 5. Concatenate all features
-        # Order: visual + xyz_norm + normals + is_inside_img + is_inside_box + dist_to_center + pose
+        # Order: visual + xyz_norm + normals + is_inside_img + is_inside_box + dist_to_center + mask_dist + pose
         all_feats = torch.cat([
             visual_feats,                    # [B, N, 384]
             geom_feats['xyz_norm'],          # [B, N, 3]
@@ -114,11 +143,12 @@ class ContactNet(nn.Module):
             geom_feats['is_inside_img'],     # [B, N, 1]
             geom_feats['is_inside_box'],     # [B, N, 1]
             geom_feats['dist_to_center'],    # [B, N, 1]
+            mask_dist,                       # [B, N, 1]
             pose_embed                       # [B, N, 32]
-        ], dim=-1)  # [B, N, 425]
+        ], dim=-1)  # [B, N, 426]
         
         # 6. Reshape for BatchNorm (requires [B*N, C])
-        all_feats_flat = all_feats.reshape(B * N, -1)  # [B*N, 425]
+        all_feats_flat = all_feats.reshape(B * N, -1)  # [B*N, 426]
         
         # 7. Classification
         logits = self.classifier(all_feats_flat)  # [B*N, 1]
@@ -154,9 +184,10 @@ if __name__ == "__main__":
     K[:, 1, 2] = 256
     
     bbox = torch.tensor([[100, 100, 300, 400], [50, 50, 200, 300]]).float().to(device)
+    mask_dist_field = torch.rand(B, 1, 512, 512).to(device)
     
     # Forward pass (returns logits)
-    logits = model(images, vertices, normals, pose_params, K, bbox)
+    logits = model(images, vertices, normals, pose_params, K, bbox, mask_dist_field)
     probs = torch.sigmoid(logits)
     
     print("Logits shape:", logits.shape)

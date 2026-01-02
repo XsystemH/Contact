@@ -132,10 +132,11 @@ class Trainer:
             pose_params = batch['pose_params'].to(self.device)
             K = batch['K'].to(self.device)
             object_bbox = batch['object_bbox'].to(self.device)
+            mask_dist_field = batch['mask_dist_field'].to(self.device)
             contact_labels = batch['contact_labels'].to(self.device)
             
             # Forward pass (returns logits)
-            logits = self.model(images, vertices, normals, pose_params, K, object_bbox)
+            logits = self.model(images, vertices, normals, pose_params, K, object_bbox, mask_dist_field)
             
             # Compute loss
             loss = self.criterion(logits, contact_labels)
@@ -184,10 +185,11 @@ class Trainer:
                 pose_params = batch['pose_params'].to(self.device)
                 K = batch['K'].to(self.device)
                 object_bbox = batch['object_bbox'].to(self.device)
+                mask_dist_field = batch['mask_dist_field'].to(self.device)
                 contact_labels = batch['contact_labels'].to(self.device)
                 
                 # Forward pass (returns logits)
-                logits = self.model(images, vertices, normals, pose_params, K, object_bbox)
+                logits = self.model(images, vertices, normals, pose_params, K, object_bbox, mask_dist_field)
                 
                 # Compute loss
                 loss = self.criterion(logits, contact_labels)
@@ -214,8 +216,12 @@ class Trainer:
         all_labels = torch.cat(all_labels, dim=0).flatten()
         metrics = compute_metrics(all_preds, all_labels)
         
-        # Visualization
-        if self.config['visualization']['enabled'] and viz_batch_cpu is not None and viz_predictions_cpu is not None:
+        # Visualization (only save at specified frequency)
+        viz_frequency = self.config['visualization'].get('save_frequency', 5)
+        if (self.config['visualization']['enabled'] and 
+            epoch % viz_frequency == 0 and 
+            viz_batch_cpu is not None and 
+            viz_predictions_cpu is not None):
             save_dir = os.path.join(
                 self.config['visualization']['save_dir'],
                 f"epoch_{epoch}"

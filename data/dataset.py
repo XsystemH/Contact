@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 import smplx
+import cv2
 
 from utils.geometry_utils import world_to_camera, scale_intrinsics, compute_vertex_normals
 
@@ -24,6 +25,7 @@ class SmplContactDataset(Dataset):
             category1/
                 id1/
                     image.jpg
+                    object_mask.png
                     smplx_parameters.json
                     contact.json
                     box_annotation.json
@@ -77,6 +79,9 @@ class SmplContactDataset(Dataset):
             self.samples = [all_samples[i] for i in indices if i < len(all_samples)]
         else:
             self.samples = all_samples
+
+        # Fail-fast: mask file is required by the model (do NOT silently skip samples)
+        self._validate_object_masks()
         
         # Image transforms
         self.transform = self._get_transforms()
@@ -135,6 +140,63 @@ class SmplContactDataset(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
+
+    def _validate_object_masks(self):
+        """Ensure required object mask file exists for all samples in this dataset view."""
+        missing = []
+        for s in self.samples:
+            mask_path = os.path.join(s['path'], 'object_mask.png')
+            if not os.path.exists(mask_path):
+                missing.append(mask_path)
+                # Show only a few to keep error readable
+                if len(missing) >= 5:
+                    break
+        if missing:
+            preview = "\n".join(f"  - {p}" for p in missing)
+            raise FileNotFoundError(
+                "[Dataset] Missing required file object_mask.png for one or more samples.\n"
+                f"{preview}\n"
+                "Fix the dataset or remove those samples."
+            )
+
+    @staticmethod
+    def _compute_dilated_distance_field(mask_np, dilation_kernel=31, dilation_iters=1):
+        """
+        Compute dilated distance field from an object mask.
+
+        Args:
+            mask_np: (H, W) uint8/boolean mask where foreground is object (non-zero/True)
+            dilation_kernel: Kernel size for morphological dilation (odd integer recommended)
+            dilation_iters: Dilation iterations
+
+        Returns:
+            dist_norm: (H, W) float32 in [0, 1], where 0 is on/inside dilated mask and increases with distance.
+        """
+        if mask_np.dtype != np.uint8:
+            mask_u8 = (mask_np > 0).astype(np.uint8)
+        else:
+            mask_u8 = (mask_np > 0).astype(np.uint8)
+
+        # Morphological dilation to fill occlusion gaps
+        k = int(dilation_kernel)
+        if k < 1:
+            k = 1
+        if k % 2 == 0:
+            k += 1
+        iters = max(1, int(dilation_iters))
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask_dilated = cv2.dilate(mask_u8, kernel, iterations=iters)
+
+        # Distance to nearest object pixel: distanceTransform computes distance to nearest zero pixel,
+        # so invert such that object pixels become zeros.
+        inv = (1 - mask_dilated).astype(np.uint8)  # 0 on object, 1 elsewhere
+        dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)  # float32
+
+        H, W = dist.shape
+        diag = float(np.sqrt(H * H + W * W) + 1e-8)
+        dist_norm = np.clip(dist / diag, 0.0, 1.0).astype(np.float32)
+        return dist_norm
     
     def __len__(self):
         return len(self.samples)
@@ -151,6 +213,7 @@ class SmplContactDataset(Dataset):
                 - pose_params: (63,) - Body pose parameters
                 - K: (3, 3) - Camera intrinsic matrix (scaled for resized image)
                 - object_bbox: (4,) - Object bounding box [x_min, y_min, x_max, y_max]
+                - mask_dist_field: (1, H, W) - Dilated distance field from object mask in [0, 1]
                 - contact_labels: (N,) - Ground truth contact labels (0 or 1)
                 - sample_id: str - Sample identifier
         """
@@ -162,6 +225,20 @@ class SmplContactDataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         original_size = image.size  # (W, H)
         image = self.transform(image)  # (3, H, W)
+
+        # 1b. Load object mask and build distance field (in resized image space)
+        mask_path = os.path.join(sample_path, 'object_mask.png')
+        if not os.path.exists(mask_path):
+            # This should already be caught in __init__, but keep an explicit guard here too.
+            raise FileNotFoundError(f"[Dataset] Missing required file: {mask_path}")
+
+        mask_img = Image.open(mask_path).convert('L')
+        # Resize to target (W, H) using nearest neighbor to keep mask edges crisp
+        mask_img = mask_img.resize((self.img_size[1], self.img_size[0]), resample=Image.NEAREST)
+        mask_np = np.array(mask_img)  # (H, W), 0..255
+
+        dist_np = self._compute_dilated_distance_field(mask_np, dilation_kernel=31, dilation_iters=1)
+        mask_dist_field = torch.from_numpy(dist_np).unsqueeze(0).float()  # (1, H, W)
         
         # 2. Load SMPL-X parameters
         with open(os.path.join(sample_path, 'smplx_parameters.json'), 'r') as f:
@@ -290,6 +367,7 @@ class SmplContactDataset(Dataset):
             'pose_params': body_pose,
             'K': K,
             'object_bbox': bbox,
+            'mask_dist_field': mask_dist_field,
             'contact_labels': contact_labels,
             'sample_id': f"{sample_info['category']}_{sample_info['id']}"
         }
@@ -306,6 +384,7 @@ def collate_fn(batch):
         'pose_params': torch.stack([item['pose_params'] for item in batch]),
         'K': torch.stack([item['K'] for item in batch]),
         'object_bbox': torch.stack([item['object_bbox'] for item in batch]),
+        'mask_dist_field': torch.stack([item['mask_dist_field'] for item in batch]),
         'contact_labels': torch.stack([item['contact_labels'] for item in batch]),
         'sample_ids': [item['sample_id'] for item in batch]
     }

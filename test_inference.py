@@ -129,10 +129,11 @@ def run_inference(model, dataset, sample_idx, device):
     pose_params = sample['pose_params'].unsqueeze(0).to(device)
     K = sample['K'].unsqueeze(0).to(device)
     object_bbox = sample['object_bbox'].unsqueeze(0).to(device)
+    mask_dist_field = sample['mask_dist_field'].unsqueeze(0).to(device)
     
     # Forward pass
     with torch.no_grad():
-        logits = model(images, vertices, normals, pose_params, K, object_bbox)
+        logits = model(images, vertices, normals, pose_params, K, object_bbox, mask_dist_field)
         probs = torch.sigmoid(logits)
     
     # Convert to binary predictions

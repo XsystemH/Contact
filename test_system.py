@@ -41,6 +41,7 @@ def test_dataset():
             print(f"  - Pose params shape: {sample['pose_params'].shape}")
             print(f"  - K shape: {sample['K'].shape}")
             print(f"  - BBox shape: {sample['object_bbox'].shape}")
+            print(f"  - Mask dist field shape: {sample['mask_dist_field'].shape}")
             print(f"  - Contact labels shape: {sample['contact_labels'].shape}")
             print(f"  - Contact ratio: {sample['contact_labels'].mean():.4f}")
             print(f"  - Sample ID: {sample['sample_id']}")
@@ -90,10 +91,11 @@ def test_model():
         K[:, 1, 2] = 256
         
         bbox = torch.tensor([[100, 100, 300, 400], [50, 50, 200, 300]]).float().to(device)
+        mask_dist_field = torch.rand(B, 1, 512, 512).to(device)
         
         # Forward pass
         with torch.no_grad():
-            logits = model(images, vertices, normals, pose_params, K, bbox)
+            logits = model(images, vertices, normals, pose_params, K, bbox, mask_dist_field)
             probs = torch.sigmoid(logits)
         
         print("✓ Forward pass successful:")

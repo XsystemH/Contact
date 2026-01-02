@@ -1,8 +1,8 @@
-# SMPL-X Contact Prediction 详细训练框架设计文档 (v2.0)
+# SMPL-X Contact Prediction 详细训练框架设计文档 (v2.1)
 
 ## **1. 任务背景与目标 (Overview)**
 
-* **核心任务**：给定单张 RGB 图像、对应的 SMPL-X 网格信息、物体 Bounding Box，预测人体网格上每个顶点的**接触概率**。  
+* **核心任务**：给定单张 RGB 图像、对应的 SMPL-X 网格信息、物体 Bounding Box（以及物体 Mask 派生的距离场），预测人体网格上每个顶点的**接触概率**。  
 * **关键挑战**：数据量少（~2500样本）、存在遮挡、人物可能未完整出现在图像中（截断）。  
 * **工程目标**：搭建一个基于 PyTorch 的模块化训练框架，确保代码可读性、可扩展性和实验的可复现性。
 
@@ -18,11 +18,12 @@
 2. **SMPL-X 顶点 (Vertices)**: $B \times N_{verts} \times 3$。世界坐标系或相机坐标系下的顶点坐标。  
 3. **SMPL-X 姿态参数 (Pose Params)**: $B \times 63$。Axis-angle 格式的姿态参数。  
 4. **相机内参 (K)**: $B \times 3 \times 3$。用于将 3D 顶点投影到 2D 图像平面。  
-5. **物体包围盒 (Object BBox)**: $B \times 4$。格式为 $[x_{min}, y_{min}, x_{max}, y_{max}]$。
+5. **物体包围盒 (Object BBox)**: $B \times 4$。格式为 $[x_{min}, y_{min}, x_{max}, y_{max}]$。  
+6. **物体 Mask 距离场 (Mask Distance Field)**: $B \times 1 \times 512 \times 512$。由 `object_mask.png` 经过**膨胀**与**距离变换**得到，归一化到 $[0, 1]$（0 表示接近/在物体 mask 上，1 表示远离物体）。
 
 ### **2.2 核心处理流程 (Processing Pipeline)**
 
-处理流程分为三个并行分支，最后进行融合。
+处理流程分为三个并行分支，最后进行融合。其中物体信息不再仅依赖粗糙 BBox，而是引入基于 Mask 的距离场作为强几何约束。
 
 #### **分支 A: 视觉特征提取 (Visual Feature Extraction)**
 
@@ -45,7 +46,19 @@
   * **区分点**: 这是一个**技术性标志**。如果为 0，明确告知 MLP 忽略全 0 的视觉特征（Padding 造成的），转而完全依赖几何和姿态先验。不要将其与 BBox 特征合并。  
 * **物体上下文 (Semantic Context)**:  
   * **Inside BBox Flag**: $F_{in\_box}$ (1维)。投影点是否在物体 BBox 内。这是**逻辑性标志**，表示接触的可能性极高。  
-  * **Distance Field**: $F_{dist}$ (1维)。投影点距离物体 BBox 中心的归一化距离。
+  * **BBox Center Distance (Legacy)**: $F_{dist\_bbox}$ (1维)。投影点距离物体 BBox 中心的归一化距离（粗糙上下文，保留用于兼容/消融）。  
+  * **Mask Distance Field (NEW)**: $F_{dist\_mask}$ (1维)。在“膨胀距离场”上按投影坐标采样得到的距离特征，用于提供更精细的物体形状约束，缓解 Over-prediction。
+
+#### **分支 B-1: 膨胀距离场构建 (Dilated Distance Field, NEW)**
+
+该分支在 **Dataset 预处理阶段**完成（图像空间），解决 `object_mask.png` 因遮挡造成的断裂：
+
+1. **读取 Mask**: `object_mask.png`（灰度/二值），Resize 到训练分辨率（512×512，nearest）。  
+2. **形态学膨胀 (Dilation)**: 使用椭圆核对 mask 做膨胀以填补遮挡空洞。  
+3. **距离变换 (Distance Transform)**: 计算每个像素到“膨胀后物体区域”的最近距离。  
+4. **归一化**: 将距离除以图像对角线长度，得到 $[0, 1]$ 的距离场。  
+
+> **Corner Case**: grid_sample 对画外点默认 padding=0，会误导为“很近”。因此在模型里会用 `is_inside_img` 将画外点的 $F_{dist\_mask}$ 强制设为 1（很远）。
 
 #### **分支 C: 全局姿态先验 (Global Pose Prior)**
 
@@ -56,13 +69,13 @@
 
 * 特征拼接:  
 
-  $$F_{final} = [F_{vis} \oplus F_{xyz} \oplus F_{normal} \oplus F_{in\_img} \oplus F_{in\_box} \oplus F_{dist} \oplus F_{pose}]$$  
+  $$F_{final} = [F_{vis} \oplus F_{xyz} \oplus F_{normal} \oplus F_{in\_img} \oplus F_{in\_box} \oplus F_{dist\_bbox} \oplus F_{dist\_mask} \oplus F_{pose}]$$  
 
-  * 总维度约为：$384 + 3 + 3 + 1 + 1 + 1 + 32 = 425$ 维。  
+  * 总维度约为：$384 + 3 + 3 + 1 + 1 + 1 + 1 + 32 = 426$ 维。  
 
 * **分类器 (Head)**: Shared MLP (Point-wise)。  
   
-  * 结构：`Linear(425, 256) -> BN -> ReLU -> Dropout -> Linear(256, 128) -> BN -> ReLU -> Dropout -> Linear(128, 1)`。  
+  * 结构：`Linear(426, 256) -> BN -> ReLU -> Dropout -> Linear(256, 128) -> BN -> ReLU -> Dropout -> Linear(128, 1)`。  
   
 * **最终输出**: Sigmoid 激活后的标量，表示接触概率 $P \in [0, 1]$。
 
@@ -94,7 +107,7 @@ smplx_contact_prediction/
 这是实现 Pixel-aligned 和 Corner Case 处理的关键。
 
 * **类定义**: class GeometryProcessor(nn.Module):  
-* **Forward 参数**: vertices (B, N, 3), K (B, 3, 3), img_size (H, W), object_bbox (B, 4)  
+* **Forward 参数**: vertices (B, N, 3), normals (B, N, 3), K (B, 3, 3), img_size (H, W), object_bbox (B, 4)  
 * **核心逻辑**:  
   1. **3D -> 2D 投影**:  
      * $P_{cam} = K \times P_{world}$  
@@ -106,9 +119,9 @@ smplx_contact_prediction/
      * is_inside_img = (mask_x & mask_y & mask_z).float().unsqueeze(-1)
   3. **归一化采样坐标**:  
      * 将 $(u, v)$ 从 $[0, W]$ 映射到 $[-1, 1]$ 用于 grid_sample。  
-  4. **物体上下文**:  
-     * 根据 object_bbox 计算 is_inside_box 和 dist_to_center。  
-  5. **返回值**: grid_coords (用于采样), geom_feats (包含 is_inside_img, in_box, dist, normals 等)。
+  4. **物体上下文 (BBox)**:  
+     * 根据 object_bbox 计算 is_inside_box 和 dist_to_center（bbox center distance）。  
+  5. **返回值**: grid_coords (用于采样), geom_feats（包含 is_inside_img, in_box, dist_to_center, normals 等）。
 
 ### **4.2 models/backbone.py (Frozen)**
 
@@ -128,9 +141,12 @@ smplx_contact_prediction/
   2. 调用 geometry_processor 得到 grid_coords 和 geom_feats。  
   3. **Visual Sampling**:  
      * F.grid_sample(feat_map, grid_coords, padding_mode='zeros') **(注意：zeros padding)**。  
-  4. **Pose Embedding**: self.pose_mlp(pose_params)。  
-  5. torch.cat 所有特征。  
-  6. 传入 MLP 得到输出。
+  4. **Mask Distance Sampling (NEW)**:  
+     * 对 `mask_dist_field` 做 grid_sample 得到每顶点 $F_{dist\_mask}$。  
+     * 用 `is_inside_img` 将画外点的 $F_{dist\_mask}$ 设为 1（远离物体），避免 padding=0 造成的伪近距离。  
+  5. **Pose Embedding**: self.pose_mlp(pose_params)。  
+  6. torch.cat 所有特征（总维度 426）。  
+  7. 传入 MLP 得到输出。
 
 ### **4.4 data/dataset.py (含数据集格式说明)**
 
@@ -139,11 +155,12 @@ smplx_contact_prediction/
 
 #### **4.4.1 数据集文件映射 (Dataset Specification)**
 
-根据您提供的文件列表，我们在 __getitem__ 中仅需加载以下**核心文件**。请忽略 *.obj (除非用于调试)、depth.npy 和 *_mask.png。
+根据您提供的文件列表，我们在 __getitem__ 中仅需加载以下**核心文件**。请忽略 *.obj (除非用于调试)、depth.npy 等非必要文件。注意：`object_mask.png` 现在是**必需输入**（缺失将直接报错）。
 
 | 原始文件名            | 对应模型输入          | 用途与处理说明                                               |
 | :-------------------- | :-------------------- | :----------------------------------------------------------- |
 | image.jpg             | **Images**            | 读取并 Resize 到 512x512，归一化。                           |
+| object_mask.png       | **Mask Distance Field** | 读取并 Resize（nearest），对 mask 做膨胀 + 距离变换，输出 `mask_dist_field`（1×H×W，归一化到[0,1]）。 |
 | smplx_parameters.json | **Pose Params**       | 读取 body_pose (63 dims) 用于 Pose Embedding。 读取 transl, global_orient, betas 等配合 smplx Layer 生成 **Vertices**。 |
 | contact.json          | **GT Labels**         | 读取 Contact Labels (0/1)。需与 Vertices 顺序严格对齐。      |
 | box_annotation.json   | **Object BBox**       | 读取物体 2D 包围盒 $[x_1, y_1, x_2, y_2]$。                  |
@@ -156,13 +173,13 @@ smplx_contact_prediction/
 ### **4.5 configs/default.yaml**
 
 ```
-model:  
-  input_dim: 425        # 384(Vis) + 6(Geom) + 1(InImg) + 2(Obj) + 32(Pose)  
-  pose_embed_dim: 32  
-training:  
-  pos_weight: 5.0       # 针对样本不平衡  
-  lr: 1e-3              # 仅用于优化 MLP Head  
-# lr_backbone: 0      # 已移除，Backbone 不参与训练
+model:
+  visual_feat_dim: 384
+  geometry_feat_dim: 3
+  normal_feat_dim: 3
+  flag_feat_dim: 4      # in_img + in_box + dist_to_center + mask_dist
+  pose_embed_dim: 32
+  total_feat_dim: 426
 ```
 
   
@@ -181,6 +198,7 @@ training:
 
 * **依赖库要求**:  
   * pip install smplx (官方库，用于从参数生成 Mesh)  
+  * pip install opencv-python (必需：用于 Mask 膨胀与距离变换 distanceTransform)  
   * pip install trimesh (可选，用于法向计算等辅助操作)  
 * **模型文件依赖 (Model Assets)**:  
   * 必须前往 [SMPL-X 官网](https://smpl-x.is.tue.mpg.de/) 注册并下载模型文件 (SMPLX_NEUTRAL.pkl, SMPLX_MALE.pkl, 等)。  
@@ -193,6 +211,7 @@ training:
 
 * **Visual Features 的脆弱性**: 在人物身体边缘，由于投影误差，很容易采样到背景像素。这就是为什么**Label Dilation（标签膨胀）**在预处理阶段极其重要——它容忍了这种边缘误差。  
 * **Zero Padding 的意义**: 务必检查 grid_sample 的 padding_mode='zeros'。如果使用默认的 border，当人有一半身体在画外时，画外的点会重复采样边缘像素，导致严重的误判。
+* **Mask 距离场的画外处理 (NEW)**: 距离场语义是“0=近，1=远”。因此必须避免画外点被 padding=0 伪装成“近距离”。本实现用 `is_inside_img` 将画外点的 $F_{dist\_mask}$ 强制设为 1。
 
 ### **5.4 训练稳定性**
 

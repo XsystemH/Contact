@@ -2,7 +2,7 @@
 
 # Data paths
 data:
-  root_dir: "/home/xhsystem/Code/Term7/Ca3OH1/data_contact"  # Root directory containing categories
+  root_dir: "/home/rtwang/workspace/Contact/data_contact"  # Root directory containing categories
   smplx_model_path: "smplx_models"  # Path to SMPLX model files (NEUTRAL.pkl, etc.)
   smplx_model_type: "neutral"  # neutral, male, or female
   img_size: [512, 512]  # [H, W]
@@ -21,11 +21,11 @@ model:
   visual_feat_dim: 384  # ResNet layer2(128) + layer3(256) = 384
   geometry_feat_dim: 3  # normalized xyz
   normal_feat_dim: 3    # normals
-  flag_feat_dim: 3      # is_inside_img(1) + is_inside_box(1) + dist_to_center(1)
+  flag_feat_dim: 4      # is_inside_img(1) + is_inside_box(1) + dist_to_center(1) + mask_dist(1)
   pose_embed_dim: 32    # pose embedding dimension
   
-  # Total input dim: 384 + 3 + 3 + 3 + 32 = 425
-  total_feat_dim: 425
+  # Total input dim: 384 + 3 + 3 + 4 + 32 = 426
+  total_feat_dim: 426
   
   # MLP Head architecture
   hidden_dims: [256, 128]  # Two hidden layers
@@ -72,6 +72,7 @@ visualization:
   enabled: true
   save_dir: "visualizations/260102_1"
   num_samples: 20  # Number of samples to visualize per epoch
+  save_frequency: 10  # Save visualizations every N epochs (set to higher value to reduce I/O overhead)
   
 # Device
 device: "cuda"  # cuda or cpu

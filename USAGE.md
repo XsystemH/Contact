@@ -318,7 +318,7 @@ model.eval()
 
 # 推理
 with torch.no_grad():
-    logits = model(images, vertices, normals, pose_params, K, bbox)
+    logits = model(images, vertices, normals, pose_params, K, bbox, mask_dist_field)
     probs = torch.sigmoid(logits)  # 转换为概率
     
     # 二值化

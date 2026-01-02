@@ -21,11 +21,11 @@ model:
   visual_feat_dim: 384  # ResNet layer2(128) + layer3(256) = 384
   geometry_feat_dim: 3  # normalized xyz
   normal_feat_dim: 3    # normals
-  flag_feat_dim: 3      # is_inside_img(1) + is_inside_box(1) + dist_to_center(1)
+  flag_feat_dim: 4      # is_inside_img(1) + is_inside_box(1) + dist_to_center(1) + mask_dist(1)
   pose_embed_dim: 32    # pose embedding dimension
   
-  # Total input dim: 384 + 3 + 3 + 3 + 32 = 425
-  total_feat_dim: 425
+  # Total input dim: 384 + 3 + 3 + 4 + 32 = 426
+  total_feat_dim: 426
   
   # MLP Head architecture
   hidden_dims: [256, 128]  # Two hidden layers
@@ -40,7 +40,7 @@ model:
 training:
   batch_size: 8  # Adjust based on GPU memory
   num_epochs: 100
-  learning_rate: 0.001
+  learning_rate: 0.00005
   weight_decay: 0.0001
   
   # Loss function
@@ -72,6 +72,7 @@ visualization:
   enabled: true
   save_dir: "visualizations"
   num_samples: 4  # Number of samples to visualize per epoch
+  save_frequency: 5  # Save visualizations every N epochs (set to higher value to reduce I/O overhead)
   
 # Device
 device: "cuda"  # cuda or cpu

@@ -6,8 +6,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import torch
+import torch.nn.functional as F
 import cv2
 from mpl_toolkits.mplot3d import Axes3D
+
+from utils.geometry_utils import project_3d_to_2d, uv_to_grid_sample_coords
 
 
 def denormalize_image(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
@@ -190,6 +193,8 @@ def visualize_batch_predictions(batch, predictions, num_samples=4, save_dir=None
         contact_labels = batch['contact_labels'][i]
         contact_pred = predictions[i]
         sample_id = batch['sample_ids'][i]
+        mask_dist_field = batch.get('mask_dist_field', None)
+        mask_dist_field_i = mask_dist_field[i] if isinstance(mask_dist_field, torch.Tensor) else None
         
         # Projection visualization
         if save_dir:
@@ -206,6 +211,46 @@ def visualize_batch_predictions(batch, predictions, num_samples=4, save_dir=None
             save_path=proj_path,
             title='Projected Vertices (Predicted Contact)'
         )
+
+        # Extra debug: visualize per-vertex sampled mask distance feature f_mask_dist
+        if mask_dist_field_i is not None:
+            # mask_dist_field_i: (1, H, W) in [0, 1] (0=near object, 1=far)
+            H, W = image.shape[-2], image.shape[-1]
+            mask_dist_field_i = mask_dist_field_i.unsqueeze(0)  # (1, 1, H, W)
+
+            with torch.no_grad():
+                uv, depth = project_3d_to_2d(vertices.unsqueeze(0), K.unsqueeze(0))  # (1,N,2), (1,N)
+                u = uv[:, :, 0]
+                v = uv[:, :, 1]
+                inside = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (depth > 0)
+                inside = inside.float().unsqueeze(-1)  # (1,N,1)
+
+                grid = uv_to_grid_sample_coords(uv, (H, W)).unsqueeze(2)  # (1,N,1,2)
+                sampled = F.grid_sample(
+                    mask_dist_field_i,
+                    grid,
+                    mode='bilinear',
+                    padding_mode='zeros',
+                    align_corners=False
+                )  # (1,1,N,1)
+                sampled = sampled.squeeze(-1).transpose(1, 2)  # (1,N,1)
+                sampled = torch.where(inside > 0.5, sampled, torch.ones_like(sampled))
+                f_mask_dist = sampled.squeeze(0).squeeze(-1).clamp(0, 1)  # (N,)
+
+            if save_dir:
+                maskdist_path = f"{save_dir}/{sample_id}_mask_dist.png"
+            else:
+                maskdist_path = None
+
+            visualize_projection(
+                image,
+                vertices,
+                K,
+                contact_values=f_mask_dist,
+                bbox=bbox_i,
+                save_path=maskdist_path,
+                title='Projected Vertices (f_mask_dist from Dilated Distance Field)'
+            )
         
         # Heatmap visualization
         if save_dir:
