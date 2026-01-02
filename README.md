@@ -1,4 +1,4 @@
-# SMPL-X Contact Prediction 详细训练框架设计文档 (v2.1)
+# SMPL-X Contact Prediction 详细训练框架设计文档 (v2.2)
 
 ## **1. 任务背景与目标 (Overview)**
 
@@ -20,6 +20,7 @@
 4. **相机内参 (K)**: $B \times 3 \times 3$。用于将 3D 顶点投影到 2D 图像平面。  
 5. **物体包围盒 (Object BBox)**: $B \times 4$。格式为 $[x_{min}, y_{min}, x_{max}, y_{max}]$。  
 6. **物体 Mask 距离场 (Mask Distance Field)**: $B \times 1 \times 512 \times 512$。由 `object_mask.png` 经过**膨胀**与**距离变换**得到，归一化到 $[0, 1]$（0 表示接近/在物体 mask 上，1 表示远离物体）。
+7. **顶点编号 (Vertex IDs, NEW)**: $B \times N_{verts}$（int64）。每个顶点在 SMPL-X 模板网格上的固定索引（通常为 $0 \ldots 10474$）。该输入可以由 Dataset 显式提供，也可以在模型内部根据 $N_{verts}$ 自动生成（本工程实现为自动生成）。
 
 ### **2.2 核心处理流程 (Processing Pipeline)**
 
@@ -65,17 +66,23 @@
 * **Pose Embedding**: 将 63 维的 Pose 参数输入一个小型的 MLP (Linear -> ReLU)，映射为 32 维的 Embedding $F_{pose}$。  
 * **广播**: 将这 32 维特征复制并拼接到每个顶点上。
 
+#### **分支 D: 网格拓扑先验 (Mesh Topology Prior, NEW)**
+
+* **Vertex ID Embedding**: 将每个顶点的整数编号 $id \in [0, N_{verts})$ 输入一个可学习的 `nn.Embedding`，得到 $F_{vid}$。  
+* **直觉**: 顶点编号对应 SMPL-X 模板上的固定语义位置（例如足底、膝盖附近等）。该 embedding 为模型提供“这是身体的哪个点”的强先验，有助于抑制不合理的过分割预测。
+
 ### **2.3 特征融合与输出 (Fusion & Output)**
 
 * 特征拼接:  
 
-  $$F_{final} = [F_{vis} \oplus F_{xyz} \oplus F_{normal} \oplus F_{in\_img} \oplus F_{in\_box} \oplus F_{dist\_bbox} \oplus F_{dist\_mask} \oplus F_{pose}]$$  
+  $$F_{final} = [F_{vis} \oplus F_{xyz} \oplus F_{normal} \oplus F_{in\_img} \oplus F_{in\_box} \oplus F_{dist\_bbox} \oplus F_{dist\_mask} \oplus F_{pose} \oplus F_{vid}]$$  
 
-  * 总维度约为：$384 + 3 + 3 + 1 + 1 + 1 + 1 + 32 = 426$ 维。  
+  * 总维度约为：$384 + 3 + 3 + 1 + 1 + 1 + 1 + 32 + D_{vid}$ 维。  
+  * 在默认配置下：$D_{vid}=16$，因此总维度为 **442**。  
 
 * **分类器 (Head)**: Shared MLP (Point-wise)。  
   
-  * 结构：`Linear(426, 256) -> BN -> ReLU -> Dropout -> Linear(256, 128) -> BN -> ReLU -> Dropout -> Linear(128, 1)`。  
+  * 结构：`Linear(442, 256) -> BN -> ReLU -> Dropout -> Linear(256, 128) -> BN -> ReLU -> Dropout -> Linear(128, 1)`（默认配置）。  
   
 * **最终输出**: Sigmoid 激活后的标量，表示接触概率 $P \in [0, 1]$。
 
@@ -145,8 +152,9 @@ smplx_contact_prediction/
      * 对 `mask_dist_field` 做 grid_sample 得到每顶点 $F_{dist\_mask}$。  
      * 用 `is_inside_img` 将画外点的 $F_{dist\_mask}$ 设为 1（远离物体），避免 padding=0 造成的伪近距离。  
   5. **Pose Embedding**: self.pose_mlp(pose_params)。  
-  6. torch.cat 所有特征（总维度 426）。  
-  7. 传入 MLP 得到输出。
+  6. **Vertex ID Embedding (NEW)**: `nn.Embedding(num_verts, D_vid)` 生成 $F_{vid}$ 并拼接。  
+  7. torch.cat 所有特征（默认总维度 442）。  
+  8. 传入 MLP 得到输出。
 
 ### **4.4 data/dataset.py (含数据集格式说明)**
 
@@ -175,11 +183,13 @@ smplx_contact_prediction/
 ```
 model:
   visual_feat_dim: 384
+  num_verts: 10475
   geometry_feat_dim: 3
   normal_feat_dim: 3
   flag_feat_dim: 4      # in_img + in_box + dist_to_center + mask_dist
   pose_embed_dim: 32
-  total_feat_dim: 426
+  vertex_id_embed_dim: 16
+  total_feat_dim: 442
 ```
 
   

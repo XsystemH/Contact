@@ -25,6 +25,8 @@ class ContactNet(nn.Module):
         super(ContactNet, self).__init__()
         
         self.config = config
+        self.num_verts = int(config.get('model', {}).get('num_verts', 10475))
+        self.vertex_id_embed_dim = int(config.get('model', {}).get('vertex_id_embed_dim', 16))
         
         # 1. Frozen visual feature extractor
         self.backbone = FeatureExtractor(pretrained=config['model']['pretrained'])
@@ -40,20 +42,36 @@ class ContactNet(nn.Module):
             nn.Linear(pose_input_dim, pose_embed_dim),
             nn.ReLU(inplace=True)
         )
+
+        # 3b. Vertex index embedding (mesh topology / body prior)
+        # Each SMPL-X vertex index corresponds to a fixed semantic location on the template mesh.
+        # We embed the index and concatenate it as a per-vertex feature.
+        if self.vertex_id_embed_dim > 0:
+            self.vertex_id_embed = nn.Embedding(self.num_verts, self.vertex_id_embed_dim)
+        else:
+            self.vertex_id_embed = None
         
         # 4. Classification MLP Head
         # Compute expected total feature dim to avoid silent concat mismatches.
         # Feature order (per-vertex):
         # visual(384) + xyz_norm(3) + normals(3)
         # + is_inside_img(1) + is_inside_box(1) + dist_to_center(1) + mask_dist(1)
-        # + pose_embed(32)
+        # + pose_embed(32) + vertex_id_embed(vertex_id_embed_dim)
         visual_feat_dim = int(config['model'].get('visual_feat_dim', 384))
         geometry_feat_dim = int(config['model'].get('geometry_feat_dim', 3))
         normal_feat_dim = int(config['model'].get('normal_feat_dim', 3))
         flag_feat_dim = int(config['model'].get('flag_feat_dim', 4))
         pose_embed_dim = int(config['model'].get('pose_embed_dim', 32))
+        vertex_id_embed_dim = int(config['model'].get('vertex_id_embed_dim', self.vertex_id_embed_dim))
 
-        computed_total_feat_dim = visual_feat_dim + geometry_feat_dim + normal_feat_dim + flag_feat_dim + pose_embed_dim
+        computed_total_feat_dim = (
+            visual_feat_dim
+            + geometry_feat_dim
+            + normal_feat_dim
+            + flag_feat_dim
+            + pose_embed_dim
+            + max(0, vertex_id_embed_dim)
+        )
         cfg_total_feat_dim = config['model'].get('total_feat_dim', None)
         if cfg_total_feat_dim is not None and int(cfg_total_feat_dim) != computed_total_feat_dim:
             print(
@@ -133,10 +151,23 @@ class ContactNet(nn.Module):
         # 4. Pose embedding
         pose_embed = self.pose_mlp(pose_params)  # [B, 32]
         pose_embed = pose_embed.unsqueeze(1).expand(-1, N, -1)  # [B, N, 32]
+
+        # 4b. Vertex id embedding (topology prior)
+        if self.vertex_id_embed is not None:
+            if N > self.num_verts:
+                raise ValueError(
+                    f"[ContactNet] vertices N={N} exceeds configured model.num_verts={self.num_verts}. "
+                    "Set model.num_verts to match your mesh vertex count."
+                )
+            vertex_ids = torch.arange(N, device=vertices.device, dtype=torch.long)  # (N,)
+            vertex_ids = vertex_ids.unsqueeze(0).expand(B, -1)  # (B, N)
+            vertex_id_embed = self.vertex_id_embed(vertex_ids)  # (B, N, D)
+        else:
+            vertex_id_embed = None
         
         # 5. Concatenate all features
-        # Order: visual + xyz_norm + normals + is_inside_img + is_inside_box + dist_to_center + mask_dist + pose
-        all_feats = torch.cat([
+        # Order: visual + xyz_norm + normals + in_img + in_box + dist_to_center + mask_dist + pose + vertex_id_embed
+        feats_to_cat = [
             visual_feats,                    # [B, N, 384]
             geom_feats['xyz_norm'],          # [B, N, 3]
             geom_feats['normals'],           # [B, N, 3]
@@ -144,11 +175,15 @@ class ContactNet(nn.Module):
             geom_feats['is_inside_box'],     # [B, N, 1]
             geom_feats['dist_to_center'],    # [B, N, 1]
             mask_dist,                       # [B, N, 1]
-            pose_embed                       # [B, N, 32]
-        ], dim=-1)  # [B, N, 426]
+            pose_embed                        # [B, N, 32]
+        ]
+        if vertex_id_embed is not None:
+            feats_to_cat.append(vertex_id_embed)  # [B, N, D]
+
+        all_feats = torch.cat(feats_to_cat, dim=-1)  # [B, N, 426 + D]
         
         # 6. Reshape for BatchNorm (requires [B*N, C])
-        all_feats_flat = all_feats.reshape(B * N, -1)  # [B*N, 426]
+        all_feats_flat = all_feats.reshape(B * N, -1)  # [B*N, 426 + D]
         
         # 7. Classification
         logits = self.classifier(all_feats_flat)  # [B*N, 1]

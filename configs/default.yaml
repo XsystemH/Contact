@@ -18,14 +18,16 @@ data:
 # Model architecture
 model:
   # Feature dimensions
+  num_verts: 10475        # SMPL-X body vertex count used by this project
   visual_feat_dim: 384  # ResNet layer2(128) + layer3(256) = 384
   geometry_feat_dim: 3  # normalized xyz
   normal_feat_dim: 3    # normals
   flag_feat_dim: 4      # is_inside_img(1) + is_inside_box(1) + dist_to_center(1) + mask_dist(1)
   pose_embed_dim: 32    # pose embedding dimension
+  vertex_id_embed_dim: 16  # NEW: learnable embedding for per-vertex index (topology/body prior)
   
-  # Total input dim: 384 + 3 + 3 + 4 + 32 = 426
-  total_feat_dim: 426
+  # Total input dim: 384 + 3 + 3 + 4 + 32 + 16 = 442
+  total_feat_dim: 442
   
   # MLP Head architecture
   hidden_dims: [256, 128]  # Two hidden layers
