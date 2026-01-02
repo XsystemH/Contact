@@ -4,6 +4,7 @@ Visualization utilities for debugging and analysis.
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import torch
 import cv2
 from mpl_toolkits.mplot3d import Axes3D
@@ -32,7 +33,7 @@ def denormalize_image(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224,
     return img
 
 
-def visualize_projection(image, vertices, K, contact_values=None, save_path=None, title=None):
+def visualize_projection(image, vertices, K, contact_values=None, bbox=None, save_path=None, title=None):
     """
     Visualize projected vertices on image.
     
@@ -41,6 +42,7 @@ def visualize_projection(image, vertices, K, contact_values=None, save_path=None
         vertices: (N, 3) - Vertices in camera space
         K: (3, 3) - Camera intrinsics
         contact_values: (N,) - Optional values for coloring (e.g., predicted probs or GT labels)
+        bbox: (4,) - Optional bbox [x_min, y_min, x_max, y_max] in pixel coords of the SAME resized image
         save_path: Path to save figure
         title: Optional plot title
     """
@@ -64,6 +66,40 @@ def visualize_projection(image, vertices, K, contact_values=None, save_path=None
     # Create visualization
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.imshow(img)
+
+    # Draw bbox if provided
+    if bbox is not None:
+        if isinstance(bbox, torch.Tensor):
+            bbox_np = bbox.detach().cpu().numpy().astype(np.float32)
+        else:
+            bbox_np = np.asarray(bbox, dtype=np.float32)
+
+        if bbox_np.shape[-1] == 4:
+            x_min, y_min, x_max, y_max = bbox_np.tolist()
+            # Clamp to image bounds for display
+            x_min = float(np.clip(x_min, 0, W - 1))
+            x_max = float(np.clip(x_max, 0, W - 1))
+            y_min = float(np.clip(y_min, 0, H - 1))
+            y_max = float(np.clip(y_max, 0, H - 1))
+
+            rect = patches.Rectangle(
+                (x_min, y_min),
+                max(0.0, x_max - x_min),
+                max(0.0, y_max - y_min),
+                linewidth=2,
+                edgecolor='lime',
+                facecolor='none',
+                alpha=0.9
+            )
+            ax.add_patch(rect)
+            ax.text(
+                x_min,
+                max(0.0, y_min - 5.0),
+                "bbox",
+                color='lime',
+                fontsize=10,
+                bbox=dict(facecolor='black', alpha=0.4, pad=2, edgecolor='none')
+            )
     
     if contact_values is not None:
         values_np = contact_values.detach().cpu().numpy()
@@ -149,6 +185,8 @@ def visualize_batch_predictions(batch, predictions, num_samples=4, save_dir=None
         image = batch['image'][i]
         vertices = batch['vertices'][i]
         K = batch['K'][i]
+        bbox = batch.get('object_bbox', None)
+        bbox_i = bbox[i] if isinstance(bbox, torch.Tensor) else None
         contact_labels = batch['contact_labels'][i]
         contact_pred = predictions[i]
         sample_id = batch['sample_ids'][i]
@@ -164,6 +202,7 @@ def visualize_batch_predictions(batch, predictions, num_samples=4, save_dir=None
             vertices,
             K,
             contact_values=contact_pred,
+            bbox=bbox_i,
             save_path=proj_path,
             title='Projected Vertices (Predicted Contact)'
         )
