@@ -1,0 +1,77 @@
+# SMPL-X Contact Prediction Configuration
+
+# Data paths
+data:
+  root_dir: "/home/xhsystem/Code/Term7/Ca3OH1/data_contact"  # Root directory containing categories
+  smplx_model_path: "smplx_models"  # Path to SMPLX model files (NEUTRAL.pkl, etc.)
+  smplx_model_type: "neutral"  # neutral, male, or female
+  img_size: [512, 512]  # [H, W]
+  num_workers: 4
+  
+  # Train/Val/Test split ratio (17:2:1)
+  train_ratio: 0.95  # 483/510
+  val_ratio: 0.03   # 15/510
+  test_ratio: 0.02   # 11/510
+  
+  random_seed: 42
+
+# Model architecture
+model:
+  # Feature dimensions
+  visual_feat_dim: 384  # ResNet layer2(128) + layer3(256) = 384
+  geometry_feat_dim: 3  # normalized xyz
+  normal_feat_dim: 3    # normals
+  flag_feat_dim: 3      # is_inside_img(1) + is_inside_box(1) + dist_to_center(1)
+  pose_embed_dim: 32    # pose embedding dimension
+  
+  # Total input dim: 384 + 3 + 3 + 3 + 32 = 425
+  total_feat_dim: 425
+  
+  # MLP Head architecture
+  hidden_dims: [256, 128]  # Two hidden layers
+  dropout: 0.3
+  
+  # ResNet backbone
+  backbone: "resnet18"
+  pretrained: true
+  freeze_backbone: true  # Always frozen
+
+# Training
+training:
+  batch_size: 8  # Adjust based on GPU memory
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  
+  # Loss function
+  pos_weight: 5.0  # Weight for positive class (contact)
+  
+  # Optimizer
+  optimizer: "adamw"
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "step"  # step, cosine, or none
+    step_size: 30
+    gamma: 0.5
+  
+  # Checkpoint
+  save_dir: "checkpoints/251226"
+  save_frequency: 5  # Save every N epochs
+  resume_from: null  # Path to checkpoint to resume from
+  
+  # Logging
+  log_interval: 10  # Print loss every N iterations
+  
+# Validation
+validation:
+  val_frequency: 1  # Validate every N epochs
+  
+# Visualization (for debugging)
+visualization:
+  enabled: true
+  save_dir: "visualizations/251226"
+  num_samples: 4  # Number of samples to visualize per epoch
+  
+# Device
+device: "cuda"  # cuda or cpu
