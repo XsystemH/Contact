@@ -2,6 +2,7 @@
 Visualization utilities for debugging and analysis.
 """
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -190,15 +191,17 @@ def visualize_batch_predictions(batch, predictions, num_samples=4, save_dir=None
         K = batch['K'][i]
         bbox = batch.get('object_bbox', None)
         bbox_i = bbox[i] if isinstance(bbox, torch.Tensor) else None
-        contact_labels = batch['contact_labels'][i]
+        contact_labels = batch['contact_labels'][i] if 'contact_labels' in batch else None
         contact_pred = predictions[i]
         sample_id = batch['sample_ids'][i]
+        # Make filenames safer (spaces and path separators can be annoying)
+        safe_sample_id = str(sample_id).replace(os.sep, "_").replace(" ", "_")
         mask_dist_field = batch.get('mask_dist_field', None)
         mask_dist_field_i = mask_dist_field[i] if isinstance(mask_dist_field, torch.Tensor) else None
         
         # Projection visualization
         if save_dir:
-            proj_path = f"{save_dir}/{sample_id}_projection.png"
+            proj_path = f"{save_dir}/{safe_sample_id}_projection.png"
         else:
             proj_path = None
         
@@ -238,7 +241,7 @@ def visualize_batch_predictions(batch, predictions, num_samples=4, save_dir=None
                 f_mask_dist = sampled.squeeze(0).squeeze(-1).clamp(0, 1)  # (N,)
 
             if save_dir:
-                maskdist_path = f"{save_dir}/{sample_id}_mask_dist.png"
+                maskdist_path = f"{save_dir}/{safe_sample_id}_mask_dist.png"
             else:
                 maskdist_path = None
 
@@ -254,7 +257,7 @@ def visualize_batch_predictions(batch, predictions, num_samples=4, save_dir=None
         
         # Heatmap visualization
         if save_dir:
-            heatmap_path = f"{save_dir}/{sample_id}_heatmap.png"
+            heatmap_path = f"{save_dir}/{safe_sample_id}_heatmap.png"
         else:
             heatmap_path = None
         
