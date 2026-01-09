@@ -17,6 +17,9 @@ opencv-python>=4.7.0
 pyyaml>=6.0
 tqdm>=4.65.0
 
+# Inference service
+flask>=2.3.0
+
 # Mesh processing (optional, for normal computation)
 trimesh>=3.21.0
 

@@ -16,6 +16,198 @@ import cv2
 from utils.geometry_utils import world_to_camera, scale_intrinsics, compute_vertex_normals
 
 
+def build_image_transform(img_size, augment=False, split='test'):
+    """Build the same image transform pipeline used by SmplContactDataset.
+
+    Args:
+        img_size: (H, W)
+        augment: whether to apply train-time augmentation
+        split: 'train'|'val'|'test'
+    """
+    if augment and split == 'train':
+        return transforms.Compose([
+            transforms.Resize(img_size),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    return transforms.Compose([
+        transforms.Resize(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+
+class SmplContactPreprocessor:
+    """Preprocess a single raw sample directory into model inputs.
+
+    This is the same processing as SmplContactDataset.__getitem__, but designed for
+    inference services (contact labels optional).
+
+    Expected files in sample_dir:
+      - image.jpg
+      - object_mask.png
+      - smplx_parameters.json
+      - calibration.json
+      - extrinsic.json
+      - box_annotation.json
+      - contact.json (optional; only used if include_contact_labels=True)
+    """
+
+    def __init__(self, smplx_model_path, smplx_model_type='neutral', img_size=(512, 512), split='test', augment=False):
+        self.img_size = img_size
+        self.split = split
+        self.augment = augment
+
+        self.smplx_model = smplx.create(
+            smplx_model_path,
+            model_type='smplx',
+            gender=smplx_model_type,
+            use_face_contour=False,
+            num_betas=10,
+            num_expression_coeffs=10,
+            ext='pkl',
+            use_pca=False
+        )
+
+        self.faces = torch.from_numpy(self.smplx_model.faces.astype(np.int64))
+        self.transform = build_image_transform(self.img_size, augment=self.augment, split=self.split)
+
+    def process_dir(self, sample_dir, include_contact_labels=False):
+        # 1. Load image
+        img_path = os.path.join(sample_dir, 'image.jpg')
+        image_pil = Image.open(img_path).convert('RGB')
+        original_size = image_pil.size  # (W, H)
+        image = self.transform(image_pil)  # (3, H, W)
+
+        # 1b. Load object mask and build distance field (in resized image space)
+        mask_path = os.path.join(sample_dir, 'object_mask.png')
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"[Preprocessor] Missing required file: {mask_path}")
+
+        mask_img = Image.open(mask_path).convert('L')
+        mask_img = mask_img.resize((self.img_size[1], self.img_size[0]), resample=Image.NEAREST)
+        mask_np = np.array(mask_img)
+        dist_np = SmplContactDataset._compute_dilated_distance_field(mask_np, dilation_kernel=31, dilation_iters=1)
+        mask_dist_field = torch.from_numpy(dist_np).unsqueeze(0).float()  # (1, H, W)
+
+        # 2. Load SMPL-X parameters
+        with open(os.path.join(sample_dir, 'smplx_parameters.json'), 'r') as f:
+            smplx_params = json.load(f)
+
+        body_pose = torch.tensor(smplx_params['body_pose'], dtype=torch.float32).flatten()  # (63,)
+
+        if 'global_orient' in smplx_params:
+            global_orient = torch.tensor(smplx_params['global_orient'], dtype=torch.float32).flatten()
+        elif 'root_pose' in smplx_params:
+            global_orient = torch.tensor(smplx_params['root_pose'], dtype=torch.float32).flatten()
+        else:
+            global_orient = torch.zeros(3, dtype=torch.float32)
+
+        if 'transl' in smplx_params:
+            transl = torch.tensor(smplx_params['transl'], dtype=torch.float32).flatten()
+        elif 'cam_trans' in smplx_params:
+            transl = torch.tensor(smplx_params['cam_trans'], dtype=torch.float32).flatten()
+        else:
+            transl = torch.zeros(3, dtype=torch.float32)
+
+        if 'betas' in smplx_params:
+            betas = torch.tensor(smplx_params['betas'], dtype=torch.float32).flatten()
+        elif 'shape' in smplx_params:
+            betas = torch.tensor(smplx_params['shape'], dtype=torch.float32).flatten()
+        else:
+            betas = torch.zeros(10, dtype=torch.float32)
+
+        # 3. Generate SMPL-X mesh vertices
+        with torch.no_grad():
+            smplx_output = self.smplx_model(
+                body_pose=body_pose.unsqueeze(0),
+                global_orient=global_orient.unsqueeze(0),
+                transl=transl.unsqueeze(0),
+                betas=betas.unsqueeze(0),
+                return_verts=True
+            )
+            vertices_world = smplx_output.vertices[0]
+
+        # 4. Load camera extrinsics
+        with open(os.path.join(sample_dir, 'extrinsic.json'), 'r') as f:
+            extrinsic = json.load(f)
+
+        if 'R' in extrinsic:
+            R = torch.tensor(extrinsic['R'], dtype=torch.float32).reshape(3, 3)
+        elif 'rotation' in extrinsic:
+            R = torch.tensor(extrinsic['rotation'], dtype=torch.float32).reshape(3, 3)
+        else:
+            R = torch.eye(3, dtype=torch.float32)
+
+        if 'T' in extrinsic:
+            T = torch.tensor(extrinsic['T'], dtype=torch.float32).flatten()
+        elif 'translation' in extrinsic:
+            T = torch.tensor(extrinsic['translation'], dtype=torch.float32).flatten()
+        else:
+            T = torch.zeros(3, dtype=torch.float32)
+
+        vertices_cam = world_to_camera(vertices_world.unsqueeze(0), R.unsqueeze(0), T.unsqueeze(0))[0]
+
+        # 5. Compute normals
+        normals = compute_vertex_normals(vertices_cam.unsqueeze(0), self.faces)[0]
+
+        # 6. Load camera intrinsics
+        with open(os.path.join(sample_dir, 'calibration.json'), 'r') as f:
+            calibration = json.load(f)
+
+        K = torch.tensor(calibration['K'], dtype=torch.float32).reshape(3, 3)
+        original_img_size = (original_size[1], original_size[0])  # (H, W)
+        K = scale_intrinsics(K, original_img_size, self.img_size)
+
+        # 7. Load object bounding box
+        with open(os.path.join(sample_dir, 'box_annotation.json'), 'r') as f:
+            bbox_data = json.load(f)
+
+        if 'bbox' in bbox_data:
+            bbox = torch.tensor(bbox_data['bbox'], dtype=torch.float32)
+        elif 'obj' in bbox_data:
+            bbox = torch.tensor(bbox_data['obj'], dtype=torch.float32)
+        else:
+            bbox = torch.tensor([100.0, 100.0, 400.0, 400.0], dtype=torch.float32)
+
+        scale_x = self.img_size[1] / original_size[0]
+        scale_y = self.img_size[0] / original_size[1]
+        bbox[0] *= scale_x
+        bbox[1] *= scale_y
+        bbox[2] *= scale_x
+        bbox[3] *= scale_y
+
+        out = {
+            'image': image,
+            'vertices': vertices_cam,
+            'normals': normals,
+            'pose_params': body_pose,
+            'K': K,
+            'object_bbox': bbox,
+            'mask_dist_field': mask_dist_field,
+        }
+
+        if include_contact_labels:
+            contact_path = os.path.join(sample_dir, 'contact.json')
+            if not os.path.exists(contact_path):
+                raise FileNotFoundError(f"[Preprocessor] Missing required file: {contact_path}")
+            with open(contact_path, 'r') as f:
+                contact_data = json.load(f)
+            if isinstance(contact_data, dict):
+                contact_labels = torch.tensor(contact_data['contact'][:10475], dtype=torch.float32)
+            elif isinstance(contact_data, list):
+                contact_labels = torch.tensor(contact_data[:10475], dtype=torch.float32)
+            else:
+                raise ValueError(f"Unknown contact data format: {type(contact_data)}")
+            if contact_labels.dtype == torch.bool:
+                contact_labels = contact_labels.float()
+            out['contact_labels'] = contact_labels
+
+        return out
+
+
 class SmplContactDataset(Dataset):
     """
     Dataset for SMPL-X contact prediction.

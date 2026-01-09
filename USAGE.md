@@ -169,6 +169,76 @@ visualizations/
 │   └── category1_id1_heatmap.png     # 接触热力图
 └── epoch_5/
     └── ...
+
+## HTTP 推理服务（Flask）
+
+项目提供一个简单的 Flask 推理服务，将训练好的 ContactNet 常驻内存并通过 HTTP 提供预测。
+
+### 1. 启动服务
+
+```bash
+# 使用默认 config（configs/default.yaml）
+python server.py --host 0.0.0.0 --port 8000
+
+# 指定 config + checkpoint
+python server.py --config configs/260102_3.yaml --checkpoint checkpoints/260102_3/best_model.pth --port 8000
+
+# 强制使用 CPU
+python server.py --device cpu
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8000/healthz
+```
+
+### 2. 调用预测接口
+
+接口：`POST /predict`
+
+数据处理器**不做预处理**时：推荐直接上传与训练数据一致的原始文件，由服务端复用仓库内预处理逻辑生成模型输入。
+
+#### 方式 A（推荐）：上传原始训练同款文件（服务端预处理）
+
+请求为 `multipart/form-data`，文件字段名固定如下（括号内为建议扩展名）：
+
+- `image`（.jpg/.png）：训练时的 `image.jpg`
+- `object_mask`（.png）：训练时的 `object_mask.png`
+- `smplx_parameters`（.json）：训练时的 `smplx_parameters.json`
+- `calibration`（.json）：训练时的 `calibration.json`（必须包含 `K`）
+- `extrinsic`（.json）：训练时的 `extrinsic.json`（必须包含 `R/T` 或 `rotation/translation`）
+- `box_annotation`（.json）：训练时的 `box_annotation.json`（包含 `bbox` 或 `obj`）
+
+服务端会复用 [data/dataset.py](data/dataset.py) 中逻辑：
+
+- 图像 resize 到 `config.data.img_size` 并按 ImageNet mean/std 归一化
+- `object_mask` 生成膨胀距离场 `mask_dist_field`（范围 [0,1]）
+- 用 SMPL-X 参数生成顶点（world），再用外参转换到相机系（camera）
+- 由顶点与 faces 计算法线 normals
+- 根据 resize 缩放相机内参 K 与 bbox 到新图像空间
+
+调用示例：
+
+```bash
+curl -X POST \
+  -F "image=@/path/to/image.jpg" \
+  -F "object_mask=@/path/to/object_mask.png" \
+  -F "smplx_parameters=@/path/to/smplx_parameters.json" \
+  -F "calibration=@/path/to/calibration.json" \
+  -F "extrinsic=@/path/to/extrinsic.json" \
+  -F "box_annotation=@/path/to/box_annotation.json" \
+  "http://127.0.0.1:8000/predict?threshold=0.5&return_probs=0"
+```
+
+### 3. 返回格式
+
+返回 JSON 包含：
+
+- `contact`: (N,) 0/1
+- `num_vertices`, `num_contact`, `contact_ratio`
+- `threshold`
+- `probs`: 可选（若 `return_probs=1`，通过 query 参数开启）
 ```
 
 ## 常见问题
