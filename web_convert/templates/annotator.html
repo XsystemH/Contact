@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manual Contact Annotation</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 { font-size: 1.5em; }
+        
+        .main-container {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+        
+        .left-panel {
+            width: 300px;
+            background: white;
+            border-right: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+        
+        .section {
+            padding: 20px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .section h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+        }
+        
+        .tool-selector {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .tool-btn {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+        }
+        
+        .tool-btn.active {
+            border-color: #667eea;
+            background: #667eea;
+            color: white;
+        }
+        
+        .tool-btn:hover:not(.active) {
+            border-color: #667eea;
+        }
+        
+        .hand-regions {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .hand-side {
+            margin-bottom: 20px;
+        }
+        
+        .hand-side h4 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 0.95em;
+        }
+        
+        .region-group {
+            margin-bottom: 15px;
+        }
+        
+        .region-group-title {
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 8px;
+            font-size: 0.9em;
+        }
+        
+        .region-item {
+            display: flex;
+            align-items: center;
+            padding: 8px;
+            margin: 5px 0;
+            background: #f8f9fa;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .region-item:hover {
+            background: #e9ecef;
+        }
+        
+        .region-item.selected {
+            background: #667eea;
+            color: white;
+        }
+        
+        .region-checkbox {
+            margin-right: 10px;
+        }
+        
+        .brush-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        
+        .control-row {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .control-row label {
+            font-weight: 600;
+            color: #555;
+            font-size: 0.9em;
+        }
+        
+        .control-row input[type="range"] {
+            width: 100%;
+        }
+        
+        .brush-mode {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .brush-mode-btn {
+            flex: 1;
+            padding: 8px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            background: white;
+            cursor: pointer;
+            font-size: 0.85em;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        
+        .brush-mode-btn.active {
+            border-color: #4CAF50;
+            background: #4CAF50;
+            color: white;
+        }
+        
+        .brush-mode-btn.erase.active {
+            border-color: #f44336;
+            background: #f44336;
+        }
+        
+        .action-buttons {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: auto;
+        }
+        
+        .btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-success {
+            background: #4CAF50;
+            color: white;
+        }
+        
+        .btn-success:hover {
+            background: #45a049;
+        }
+        
+        .btn-secondary {
+            background: #9E9E9E;
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background: #757575;
+        }
+        
+        .right-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .viz-container {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            padding: 20px;
+            overflow: hidden;
+        }
+        
+        .viz-box {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .viz-title {
+            padding: 10px 15px;
+            background: #f5f7fa;
+            border-bottom: 1px solid #e0e0e0;
+            font-weight: 600;
+            color: #333;
+            font-size: 0.9em;
+        }
+        
+        .viz-content {
+            flex: 1;
+            position: relative;
+        }
+        
+        .plot {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .stats-info {
+            padding: 15px 20px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            justify-content: space-around;
+            font-size: 0.9em;
+        }
+        
+        .stat-item {
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .stat-label {
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .message {
+            padding: 15px 20px;
+            margin: 20px;
+            border-radius: 8px;
+            border-left: 4px solid;
+        }
+        
+        .message.info {
+            background: #e3f2fd;
+            border-color: #2196F3;
+            color: #1976D2;
+        }
+        
+        .message.success {
+            background: #e8f5e9;
+            border-color: #4CAF50;
+            color: #2e7d32;
+        }
+        
+        .message.error {
+            background: #ffebee;
+            border-color: #f44336;
+            color: #c62828;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>✏️ Manual Contact Annotation</h1>
+        <button class="btn btn-secondary" onclick="goBack()">← Back to Viewer</button>
+    </div>
+    
+    <div class="main-container">
+        <div class="left-panel">
+            <!-- Tool Selection -->
+            <div class="section">
+                <h3>Tool Selection</h3>
+                <div class="tool-selector">
+                    <button class="tool-btn active" id="toolNavigate" onclick="selectTool('navigate')">
+                        🔍 Navigate
+                    </button>
+                    <button class="tool-btn" id="toolBrush" onclick="selectTool('brush')">
+                        🖌️ Brush
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Hand Region Selection -->
+            <div class="section" id="regionSection">
+                <h3>Hand Region Selection</h3>
+                <div class="hand-regions">
+                    <div class="hand-side">
+                        <h4>🖐️ Left Hand</h4>
+                        <!-- Thumb -->
+                        <div class="region-group">
+                            <div class="region-group-title">Thumb</div>
+                            <div class="region-item" data-region="left_thumb_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="left_thumb_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="left_thumb_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Index -->
+                        <div class="region-group">
+                            <div class="region-group-title">Index</div>
+                            <div class="region-item" data-region="left_index_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="left_index_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="left_index_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Middle -->
+                        <div class="region-group">
+                            <div class="region-group-title">Middle</div>
+                            <div class="region-item" data-region="left_middle_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="left_middle_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="left_middle_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Ring -->
+                        <div class="region-group">
+                            <div class="region-group-title">Ring</div>
+                            <div class="region-item" data-region="left_ring_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="left_ring_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="left_ring_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Pinky -->
+                        <div class="region-group">
+                            <div class="region-group-title">Pinky</div>
+                            <div class="region-item" data-region="left_pinky_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="left_pinky_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="left_pinky_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Palm -->
+                        <div class="region-group">
+                            <div class="region-group-title">Palm</div>
+                            <div class="region-item" data-region="left_palm_center" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Center</span>
+                            </div>
+                            <div class="region-item" data-region="left_palm_thumb_side" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Thumb Side</span>
+                            </div>
+                            <div class="region-item" data-region="left_palm_pinky_side" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Pinky Side</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="hand-side">
+                        <h4>🖐️ Right Hand</h4>
+                        <!-- Thumb -->
+                        <div class="region-group">
+                            <div class="region-group-title">Thumb</div>
+                            <div class="region-item" data-region="right_thumb_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="right_thumb_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="right_thumb_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Index -->
+                        <div class="region-group">
+                            <div class="region-group-title">Index</div>
+                            <div class="region-item" data-region="right_index_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="right_index_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="right_index_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Middle -->
+                        <div class="region-group">
+                            <div class="region-group-title">Middle</div>
+                            <div class="region-item" data-region="right_middle_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="right_middle_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="right_middle_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Ring -->
+                        <div class="region-group">
+                            <div class="region-group-title">Ring</div>
+                            <div class="region-item" data-region="right_ring_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="right_ring_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="right_ring_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Pinky -->
+                        <div class="region-group">
+                            <div class="region-group-title">Pinky</div>
+                            <div class="region-item" data-region="right_pinky_tip" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Tip</span>
+                            </div>
+                            <div class="region-item" data-region="right_pinky_middle" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Middle</span>
+                            </div>
+                            <div class="region-item" data-region="right_pinky_base" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Base</span>
+                            </div>
+                        </div>
+                        <!-- Palm -->
+                        <div class="region-group">
+                            <div class="region-group-title">Palm</div>
+                            <div class="region-item" data-region="right_palm_center" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Center</span>
+                            </div>
+                            <div class="region-item" data-region="right_palm_thumb_side" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Thumb Side</span>
+                            </div>
+                            <div class="region-item" data-region="right_palm_pinky_side" onclick="toggleRegion(this)">
+                                <input type="checkbox" class="region-checkbox"><span>Pinky Side</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <button class="btn btn-primary" onclick="applyRegionSelection()" style="margin-top: 15px;">
+                    Apply Selection
+                </button>
+            </div>
+            
+            <!-- Brush Controls -->
+            <div class="section" id="brushSection" style="display: none;">
+                <h3>Brush Settings</h3>
+                <div class="brush-controls">
+                    <div class="control-row">
+                        <label>Brush Size: <span id="brushSizeLabel">5</span></label>
+                        <input type="range" id="brushSize" min="1" max="20" value="5" oninput="updateBrushSize(this.value)">
+                    </div>
+                    
+                    <div class="control-row">
+                        <label>Brush Mode</label>
+                        <div class="brush-mode">
+                            <button class="brush-mode-btn active" id="modeAdd" onclick="setBrushMode('add')">
+                                ➕ Add
+                            </button>
+                            <button class="brush-mode-btn erase" id="modeErase" onclick="setBrushMode('erase')">
+                                ➖ Erase
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="control-row">
+                        <label>Target Mesh</label>
+                        <select id="targetMesh" class="btn" style="padding: 8px;">
+                            <option value="human">Human Body</option>
+                            <option value="object">Object</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Actions -->
+            <div class="section action-buttons">
+                <button class="btn btn-success" onclick="saveAnnotation()">
+                    💾 Save Annotation
+                </button>
+                <button class="btn btn-secondary" onclick="clearAnnotation()">
+                    🗑️ Clear All
+                </button>
+            </div>
+        </div>
+        
+        <div class="right-panel">
+            <div id="messageArea"></div>
+            
+            <div class="viz-container">
+                <div class="viz-box">
+                    <div class="viz-title">Human Mesh - Interactive</div>
+                    <div class="viz-content">
+                        <div id="plotHuman" class="plot"></div>
+                    </div>
+                </div>
+                
+                <div class="viz-box">
+                    <div class="viz-title">Object Mesh - Interactive</div>
+                    <div class="viz-content">
+                        <div id="plotObject" class="plot"></div>
+                    </div>
+                </div>
+                
+                <div class="viz-box">
+                    <div class="viz-title">Combined View</div>
+                    <div class="viz-content">
+                        <div id="plotCombined" class="plot"></div>
+                    </div>
+                </div>
+                
+                <div class="viz-box">
+                    <div class="viz-title">Reference Image</div>
+                    <div class="viz-content" style="display: flex; align-items: center; justify-content: center; overflow: hidden;">
+                        <img id="refImage" style="width: 100%; height: 100%; object-fit: contain; background: #000;">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stats-info">
+                <div class="stat-item">
+                    <div class="stat-value" id="statHumanAnnotated">0</div>
+                    <div class="stat-label">Human Annotated</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="statObjectAnnotated">0</div>
+                    <div class="stat-label">Object Annotated</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="statTotal">0</div>
+                    <div class="stat-label">Total Contact</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/static/annotator.js"></script>
+</body>
+</html>

@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task Viewer - Data Convert Tool</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            font-size: 1.5em;
+        }
+        
+        .stats-bar {
+            display: flex;
+            gap: 20px;
+            font-size: 0.9em;
+        }
+        
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .main-container {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+        
+        .left-panel {
+            width: 300px;
+            background: white;
+            border-right: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .task-info {
+            padding: 20px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .task-info h2 {
+            color: #333;
+            font-size: 1.2em;
+            margin-bottom: 10px;
+        }
+        
+        .info-item {
+            margin: 8px 0;
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        .info-label {
+            font-weight: 600;
+            color: #667eea;
+        }
+        
+        .controls {
+            padding: 20px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .control-group label {
+            font-weight: 600;
+            color: #333;
+            font-size: 0.9em;
+        }
+        
+        .control-group input {
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+        
+        .control-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-success {
+            background: #4CAF50;
+            color: white;
+        }
+        
+        .btn-success:hover {
+            background: #45a049;
+        }
+        
+        .btn-danger {
+            background: #f44336;
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: #da190b;
+        }
+        
+        .btn-secondary {
+            background: #9E9E9E;
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background: #757575;
+        }
+        
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .action-buttons {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: auto;
+        }
+        
+        .right-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .viz-container {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            gap: 10px;
+            padding: 20px;
+            overflow: auto;
+        }
+        
+        .viz-box {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .viz-title {
+            padding: 10px 15px;
+            background: #f5f7fa;
+            border-bottom: 1px solid #e0e0e0;
+            font-weight: 600;
+            color: #333;
+            font-size: 0.9em;
+        }
+        
+        .viz-content {
+            flex: 1;
+            position: relative;
+        }
+        
+        .plot {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .reference-image {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+            display: block;
+        }
+        
+        .viz-box:last-child .viz-content {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        
+        .stats-box {
+            background: white;
+            border-radius: 12px;
+            padding: 15px;
+            margin: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-top: 10px;
+        }
+        
+        .stat-item-box {
+            text-align: center;
+            padding: 10px;
+            background: #f5f7fa;
+            border-radius: 8px;
+        }
+        
+        .stat-value-big {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .stat-label-small {
+            font-size: 0.8em;
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            font-size: 1.2em;
+            color: #999;
+        }
+        
+        .error {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            margin: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #c62828;
+        }
+        
+        .success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            padding: 15px;
+            margin: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #2e7d32;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 Task Viewer</h1>
+        <div class="stats-bar">
+            <div class="stat-item">
+                <span>Total:</span>
+                <strong id="headerTotal">-</strong>
+            </div>
+            <div class="stat-item">
+                <span>Completed:</span>
+                <strong id="headerCompleted">-</strong>
+            </div>
+            <div class="stat-item">
+                <span>Users:</span>
+                <strong id="headerUsers">-</strong>
+            </div>
+        </div>
+    </div>
+    
+    <div class="main-container">
+        <div class="left-panel">
+            <div class="task-info">
+                <h2>Current Task</h2>
+                <div class="info-item">
+                    <span class="info-label">Category:</span>
+                    <span id="taskCategory">-</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Path:</span>
+                    <span id="taskPath">-</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Task ID:</span>
+                    <span id="taskId">-</span>
+                </div>
+            </div>
+            
+            <div class="controls">
+                <div class="control-group">
+                    <label for="distanceRatio">Distance Ratio:</label>
+                    <input type="number" id="distanceRatio" min="0.01" max="3.0" step="0.01" value="0.5">
+                </div>
+
+                <div class="control-group">
+                    <label for="contactnetThreshold">ContactNet Threshold:</label>
+                    <input type="number" id="contactnetThreshold" min="0.0" max="1.0" step="0.01" value="0.5">
+                </div>
+                
+                <!-- Manual annotation status indicator -->
+                <div id="manualAnnotationStatus" style="display: none; padding: 10px; background: #FFF3E0; border-left: 4px solid #FF9800; border-radius: 4px; font-size: 0.85em; color: #E65100;">
+                    📌 Manual: 0 faces
+                </div>
+                
+                <button class="btn btn-primary" id="btnPreview">
+                    🔄 Update Preview
+                </button>
+
+                <button class="btn btn-primary" id="btnUseContactNet" style="background:#3949AB;">
+                    🤖 Use ContactNet
+                </button>
+                
+                <div class="action-buttons">
+                    <button class="btn btn-success" id="btnAccept">
+                        ✓ Accept & Process
+                    </button>
+                    <button class="btn btn-warning" id="btnManualAnnotate" style="background: #FF9800; color: white;">
+                        ✋ Manual Annotate
+                    </button>
+                    <button class="btn btn-danger" id="btnSkip">
+                        ✗ Skip This Task
+                    </button>
+                    <button class="btn btn-secondary" id="btnNext">
+                        → Get Next Task
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="right-panel">
+            <div id="messageArea"></div>
+            
+            <div class="viz-container" id="vizContainer" style="display: none;">
+                <div class="viz-box">
+                    <div class="viz-title">Human Mesh with Contact</div>
+                    <div class="viz-content">
+                        <div id="plotHuman" class="plot"></div>
+                    </div>
+                </div>
+                
+                <div class="viz-box">
+                    <div class="viz-title">Object Mesh with Contact</div>
+                    <div class="viz-content">
+                        <div id="plotObject" class="plot"></div>
+                    </div>
+                </div>
+                
+                <div class="viz-box">
+                    <div class="viz-title">Combined View</div>
+                    <div class="viz-content">
+                        <div id="plotCombined" class="plot"></div>
+                    </div>
+                </div>
+                
+                <div class="viz-box">
+                    <div class="viz-title">Reference Image</div>
+                    <div class="viz-content">
+                        <img id="refImage" class="reference-image" alt="Reference Image">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stats-box" id="statsBox" style="display: none;">
+                <strong>Contact Statistics:</strong>
+                <div class="stats-grid">
+                    <div class="stat-item-box">
+                        <div class="stat-value-big" id="statHumanTotal">-</div>
+                        <div class="stat-label-small">Human Total</div>
+                    </div>
+                    <div class="stat-item-box">
+                        <div class="stat-value-big" id="statObjTotal">-</div>
+                        <div class="stat-label-small">Object Total</div>
+                    </div>
+                    <div class="stat-item-box">
+                        <div class="stat-value-big" id="statTotal">-</div>
+                        <div class="stat-label-small">Total Contact</div>
+                    </div>
+                    <div class="stat-item-box">
+                        <div class="stat-value-big" id="statHumanInterior">-</div>
+                        <div class="stat-label-small">H Interior</div>
+                    </div>
+                    <div class="stat-item-box">
+                        <div class="stat-value-big" id="statHumanProximity">-</div>
+                        <div class="stat-label-small">H Proximity</div>
+                    </div>
+                    <div class="stat-item-box">
+                        <div class="stat-value-big" id="statHumanBoth">-</div>
+                        <div class="stat-label-small">H Both</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/static/viewer.js"></script>
+</body>
+</html>

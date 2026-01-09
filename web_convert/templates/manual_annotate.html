@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manual Contact Annotation</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            color: #fff;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #FF9800 0%, #F57C00 100%);
+            padding: 12px 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 { font-size: 1.3em; }
+        
+        .header-info {
+            display: flex;
+            gap: 20px;
+            font-size: 0.9em;
+        }
+        
+        .main-container {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+        
+        /* Left panel - Reference image and hand regions */
+        .left-panel {
+            width: 320px;
+            background: #16213e;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid #0f3460;
+        }
+        
+        .ref-image-container {
+            padding: 10px;
+            border-bottom: 1px solid #0f3460;
+        }
+        
+        .ref-image-container img {
+            width: 100%;
+            border-radius: 8px;
+        }
+        
+        .hand-regions {
+            flex: 1;
+            padding: 15px;
+            overflow-y: auto;
+        }
+        
+        .hand-regions h3 {
+            color: #FF9800;
+            margin-bottom: 10px;
+            font-size: 0.95em;
+        }
+        
+        .hand-section {
+            margin-bottom: 15px;
+        }
+        
+        .hand-section-title {
+            font-weight: 600;
+            color: #e94560;
+            margin-bottom: 8px;
+            font-size: 0.85em;
+        }
+        
+        .finger-group {
+            margin-bottom: 10px;
+        }
+        
+        .finger-name {
+            color: #aaa;
+            font-size: 0.8em;
+            margin-bottom: 4px;
+        }
+        
+        .region-checkboxes {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 4px;
+        }
+        
+        .region-cb {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .region-cb input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+            accent-color: #FF9800;
+        }
+        
+        .region-cb label {
+            font-size: 0.7em;
+            color: #888;
+            margin-left: 2px;
+        }
+        
+        .palm-regions {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 4px;
+            margin-top: 5px;
+        }
+        
+        /* Center - 3D Viewer */
+        .center-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+        
+        .mode-bar {
+            background: #0f3460;
+            padding: 10px 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .mode-btn {
+            padding: 8px 14px;
+            border: 2px solid #FF9800;
+            background: transparent;
+            color: #FF9800;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            font-size: 0.85em;
+        }
+        
+        .mode-btn.active {
+            background: #FF9800;
+            color: #1a1a2e;
+        }
+        
+        .mode-btn:hover {
+            background: rgba(255, 152, 0, 0.2);
+        }
+        
+        .mode-info {
+            color: #aaa;
+            font-size: 0.85em;
+            margin-left: auto;
+        }
+        
+        /* Brush controls */
+        #brushControls {
+            display: none;
+            background: #0a1628;
+            padding: 10px 20px;
+            align-items: center;
+            gap: 15px;
+            border-bottom: 1px solid #0f3460;
+        }
+        
+        #brushControls.visible {
+            display: flex;
+        }
+        
+        .brush-slider-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .brush-slider-container label {
+            color: #aaa;
+            font-size: 0.85em;
+        }
+        
+        #brushSize {
+            width: 120px;
+            accent-color: #FF9800;
+        }
+        
+        #brushSizeValue {
+            color: #FF9800;
+            font-weight: 600;
+            min-width: 30px;
+        }
+        
+        .brush-action-btn {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.85em;
+            display: none;
+        }
+        
+        #btnConfirmBrush {
+            background: #4CAF50;
+            color: white;
+        }
+        
+        #btnCancelBrush {
+            background: #f44336;
+            color: white;
+        }
+        
+        #threeContainer {
+            flex: 1;
+            cursor: grab;
+        }
+        
+        #threeContainer.annotate-mode {
+            cursor: crosshair;
+        }
+        
+        #threeContainer.brush-mode {
+            cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="14" fill="none" stroke="%23FF9800" stroke-width="2"/></svg>') 16 16, crosshair;
+        }
+        
+        #threeContainer.mapping-mode {
+            cursor: pointer;
+        }
+        
+        /* Right panel - Actions */
+        .right-panel {
+            width: 200px;
+            background: #16213e;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            border-left: 1px solid #0f3460;
+        }
+        
+        .action-btn {
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-save {
+            background: #4CAF50;
+            color: white;
+        }
+        
+        .btn-save:hover {
+            background: #45a049;
+        }
+        
+        .btn-clear {
+            background: #f44336;
+            color: white;
+        }
+        
+        .btn-clear:hover {
+            background: #da190b;
+        }
+        
+        .btn-back {
+            background: #9E9E9E;
+            color: white;
+        }
+        
+        .btn-back:hover {
+            background: #757575;
+        }
+        
+        .btn-mapping {
+            background: #2196F3;
+            color: white;
+        }
+        
+        .btn-mapping:hover {
+            background: #1976D2;
+        }
+        
+        .stats-panel {
+            margin-top: auto;
+            padding: 10px;
+            background: #0f3460;
+            border-radius: 8px;
+        }
+        
+        .stats-panel h4 {
+            color: #FF9800;
+            margin-bottom: 8px;
+            font-size: 0.9em;
+        }
+        
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            color: #aaa;
+            font-size: 0.8em;
+            margin: 4px 0;
+        }
+        
+        .stat-value {
+            color: #fff;
+            font-weight: 600;
+        }
+        
+        /* Mapping modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 1000;
+        }
+        
+        .modal-overlay.active {
+            display: flex;
+        }
+        
+        .modal-content {
+            background: #16213e;
+            padding: 20px;
+            width: 350px;
+            max-height: 100vh;
+            overflow-y: auto;
+            border-right: 1px solid #0f3460;
+        }
+        
+        .modal-content h2 {
+            color: #FF9800;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+        }
+        
+        .modal-content p {
+            color: #aaa;
+            font-size: 0.85em;
+            margin-bottom: 15px;
+        }
+        
+        /* Mapping region list */
+        #mappingRegionList {
+            max-height: calc(100vh - 200px);
+            overflow-y: auto;
+        }
+        
+        .mapping-hand-section {
+            margin-bottom: 15px;
+        }
+        
+        .mapping-hand-section h4 {
+            color: #e94560;
+            margin-bottom: 10px;
+            font-size: 0.95em;
+        }
+        
+        .mapping-finger {
+            margin-bottom: 8px;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+        }
+        
+        .finger-label {
+            color: #aaa;
+            font-size: 0.75em;
+            min-width: 45px;
+            padding-top: 4px;
+        }
+        
+        .mapping-segments {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 3px;
+        }
+        
+        .mapping-region-btn {
+            padding: 4px 6px;
+            border: 1px solid #0f3460;
+            background: #1a1a2e;
+            color: #888;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.7em;
+            transition: all 0.2s;
+        }
+        
+        .mapping-region-btn:hover {
+            background: #2a2a4e;
+            color: #fff;
+        }
+        
+        .mapping-region-btn.active {
+            background: #4CAF50;
+            border-color: #4CAF50;
+            color: white;
+        }
+        
+        .mapping-region-btn.mapped {
+            background: #2196F3;
+            border-color: #2196F3;
+            color: white;
+        }
+        
+        .modal-actions {
+            margin-top: 15px;
+            display: flex;
+            gap: 10px;
+            position: sticky;
+            bottom: 0;
+            background: #16213e;
+            padding-top: 10px;
+        }
+        
+        .modal-actions .action-btn {
+            flex: 1;
+            padding: 10px;
+            font-size: 0.9em;
+        }
+        
+        /* Three container in mapping mode */
+        .modal-overlay.active + .main-container .center-panel {
+            pointer-events: auto;
+        }
+        
+        /* Tooltip for face hover */
+        #faceTooltip {
+            position: absolute;
+            background: rgba(0,0,0,0.8);
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            pointer-events: none;
+            display: none;
+            z-index: 100;
+        }
+        
+        /* Instructions */
+        .instructions {
+            padding: 10px 15px;
+            background: #0f3460;
+            color: #aaa;
+            font-size: 0.8em;
+            line-height: 1.5;
+        }
+        
+        .instructions kbd {
+            background: #1a1a2e;
+            padding: 2px 6px;
+            border-radius: 3px;
+            color: #FF9800;
+        }
+        
+        /* Color legend */
+        .color-legend {
+            padding: 10px;
+            background: #0a1628;
+            border-top: 1px solid #0f3460;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.75em;
+            color: #aaa;
+            margin: 3px 0;
+        }
+        
+        .legend-color {
+            width: 14px;
+            height: 14px;
+            border-radius: 3px;
+        }
+        
+        .legend-color.yellow { background: #ffff00; }
+        .legend-color.red { background: #ff0000; }
+        .legend-color.orange { background: #ffcc00; }
+        .legend-color.blue { background: #2196F3; }
+        .legend-color.green { background: #00ff00; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>✋ Manual Contact Annotation</h1>
+        <div class="header-info">
+            <span>Task: <strong id="taskPath">-</strong></span>
+            <span>Mode: <strong id="currentMode">Navigate</strong></span>
+        </div>
+    </div>
+    
+
+    
+    <div class="main-container">
+        <!-- Left Panel: Image + Hand Regions -->
+        <div class="left-panel">
+            <div class="ref-image-container">
+                <img id="refImage" src="" alt="Reference Image">
+            </div>
+            
+            <div class="hand-regions">
+                <!-- Left Hand -->
+                <div class="hand-section">
+                    <h3>🤚 Left Hand</h3>
+                    <div id="leftHandRegions"></div>
+                </div>
+                
+                <!-- Right Hand -->
+                <div class="hand-section">
+                    <h3>✋ Right Hand</h3>
+                    <div id="rightHandRegions"></div>
+                </div>
+            </div>
+            
+            <div class="color-legend">
+                <div class="legend-item"><span class="legend-color yellow"></span> Hover</div>
+                <div class="legend-item"><span class="legend-color red"></span> Selected</div>
+                <div class="legend-item"><span class="legend-color orange"></span> Brush pending</div>
+                <div class="legend-item"><span class="legend-color blue"></span> Mapped region</div>
+                <div class="legend-item"><span class="legend-color green"></span> Mapping target</div>
+            </div>
+            
+            <div class="instructions">
+                <strong>Keyboard Shortcuts:</strong><br>
+                <kbd>1</kbd> Navigate &nbsp;
+                <kbd>2</kbd> Annotate &nbsp;
+                <kbd>3</kbd> Brush &nbsp;
+                <kbd>4</kbd> Erase<br>
+                <kbd>Ctrl+Z</kbd> Undo &nbsp;
+                <kbd>Ctrl+Y</kbd> Redo &nbsp;
+                <kbd>Esc</kbd> Cancel
+            </div>
+        </div>
+        
+        <!-- Center: 3D Viewer -->
+        <div class="center-panel">
+            <div class="mode-bar">
+                <button class="mode-btn active" id="btnNavigate" data-mode="navigate">
+                    🖐 Navigate (1)
+                </button>
+                <button class="mode-btn" id="btnAnnotate" data-mode="annotate">
+                    🎯 Annotate (2)
+                </button>
+                <button class="mode-btn" id="btnBrush" data-mode="brush">
+                    🖌 Brush (3)
+                </button>
+                <button class="mode-btn" id="btnErase" data-mode="erase">
+                    🧽 Erase (4)
+                </button>
+                <span class="mode-info" id="modeInfo">Drag to rotate, scroll to zoom</span>
+            </div>
+            
+            <!-- Brush controls (shown in brush mode) -->
+            <div id="brushControls">
+                <div class="brush-slider-container">
+                    <label>Brush Size:</label>
+                    <input type="range" id="brushSize" min="5" max="100" value="30">
+                    <span id="brushSizeValue">30</span>px
+                </div>
+                <button class="brush-action-btn" id="btnConfirmBrush">✓ Confirm</button>
+                <button class="brush-action-btn" id="btnCancelBrush">✗ Cancel</button>
+            </div>
+            
+            <div id="threeContainer"></div>
+            <div id="faceTooltip"></div>
+        </div>
+        
+        <!-- Right Panel: Actions -->
+        <div class="right-panel">
+            <button class="action-btn btn-save" id="btnSave">
+                💾 Save Annotation
+            </button>
+            <button class="action-btn btn-clear" id="btnClear">
+                🗑 Clear Selection
+            </button>
+            <div style="display: flex; gap: 8px;">
+                <button class="action-btn" id="btnUndo" style="flex:1; background:#607D8B; color:white;">
+                    ↶ Undo
+                </button>
+                <button class="action-btn" id="btnRedo" style="flex:1; background:#607D8B; color:white;">
+                    ↷ Redo
+                </button>
+            </div>
+            <button class="action-btn btn-back" id="btnBack">
+                ← Back to Viewer
+            </button>
+            
+            <div class="stats-panel">
+                <h4>Selection Stats</h4>
+                <div class="stat-row">
+                    <span>Selected Faces:</span>
+                    <span class="stat-value" id="statFaces">0</span>
+                </div>
+                <div class="stat-row">
+                    <span>Hand Regions:</span>
+                    <span class="stat-value" id="statHandRegions">0</span>
+                </div>
+                <div class="stat-row">
+                    <span>Est. Vertices:</span>
+                    <span class="stat-value" id="statVertices">-</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/static/manual_annotate.js"></script>
+</body>
+</html>
