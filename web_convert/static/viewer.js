@@ -33,6 +33,7 @@ const headerUsers = document.getElementById('headerUsers');
 socket.on('connect', () => {
     console.log('Connected to server');
     showMessage('Connected to server', 'success');
+    socket.emit('request_model_status');
 });
 
 socket.on('connected', (data) => {
@@ -43,6 +44,107 @@ socket.on('stats_update', (stats) => {
     headerTotal.textContent = stats.total;
     headerCompleted.textContent = stats.completed;
     headerUsers.textContent = stats.active_users;
+});
+
+socket.on('training_status', (data) => {
+    // Two possible payload types:
+    // - snapshot: {running, pending_new_labels, ...}
+    // - event: {state: started|finished|failed, ...}
+    try {
+        if (!data) return;
+        const badge = document.getElementById('autoTrainBadge');
+        const txt = document.getElementById('autoTrainText');
+
+        function setBadge(kind, text) {
+            if (!badge || !txt) return;
+            badge.classList.remove('badge-idle', 'badge-pending', 'badge-running', 'badge-ok', 'badge-failed');
+            badge.classList.add(`badge-${kind}`);
+            txt.textContent = text;
+        }
+
+        if (data.state === 'started') {
+            setBadge('running', `running (+${data.additional_epochs})`);
+            showMessage(
+                `Auto-train started: +${data.additional_epochs} epochs (triggered by ${data.inflight_new_labels}/${data.every_n} new labels).`,
+                'success'
+            );
+            return;
+        }
+        if (data.state === 'finished') {
+            setBadge('ok', `ok (${Math.round((data.duration_s || 0))}s)`);
+            showMessage(`Auto-train finished. Inference server reloaded.`, 'success');
+            socket.emit('request_model_status');
+            return;
+        }
+        if (data.state === 'failed') {
+            setBadge('failed', `failed`);
+            showMessage(`Auto-train failed: ${data.error || 'Unknown error'}`, 'error');
+            return;
+        }
+        // Snapshot
+        if (!data.enabled) {
+            setBadge('idle', 'off');
+            return;
+        }
+        const pending = data.pending_new_labels || 0;
+        const everyN = data.every_n_new_labels || data.every_n || '-';
+        if (data.running) {
+            setBadge('running', 'running');
+        } else if (pending > 0) {
+            setBadge('pending', `${pending}/${everyN}`);
+        } else {
+            setBadge('idle', `on (0/${everyN})`);
+        }
+    } catch (e) {
+        // no-op
+    }
+});
+
+socket.on('model_status', (data) => {
+    try {
+        const modelBadge = document.getElementById('modelBadge');
+        const modelText = document.getElementById('modelText');
+        const autoTrainModelBadge = document.getElementById('autoTrainModelBadge');
+        const autoTrainModelText = document.getElementById('autoTrainModelText');
+
+        function setBadge(el, kind) {
+            if (!el) return;
+            el.classList.remove('badge-idle', 'badge-pending', 'badge-running', 'badge-ok', 'badge-failed');
+            el.classList.add(`badge-${kind}`);
+        }
+
+        // Inference server currently loaded checkpoint
+        if (modelBadge && modelText) {
+            if (data && data.inference && data.inference.ok) {
+                setBadge(modelBadge, 'ok');
+                modelText.textContent = data.inference.name || 'loaded';
+                modelBadge.title = data.inference.checkpoint || 'loaded';
+            } else {
+                setBadge(modelBadge, 'failed');
+                modelText.textContent = 'unavailable';
+                modelBadge.title = (data && data.inference && data.inference.error) ? data.inference.error : 'unavailable';
+            }
+        }
+
+        // Latest AutoTrain best_model path/name
+        if (autoTrainModelBadge && autoTrainModelText) {
+            const at = data && data.autotrain ? data.autotrain : null;
+            if (at && at.last_checkpoint) {
+                setBadge(autoTrainModelBadge, at.last_ok === false ? 'failed' : 'ok');
+                autoTrainModelText.textContent = at.last_name || 'best_model.pth';
+                const bestInfo = at.last_best_checkpoint
+                    ? `best: ${at.last_best_checkpoint} (updated: ${at.last_best_updated})`
+                    : 'best: -';
+                autoTrainModelBadge.title = `${at.last_checkpoint}\n${bestInfo}`;
+            } else {
+                setBadge(autoTrainModelBadge, 'idle');
+                autoTrainModelText.textContent = '-';
+                autoTrainModelBadge.title = 'No AutoTrain checkpoint yet';
+            }
+        }
+    } catch (e) {
+        // no-op
+    }
 });
 
 socket.on('task_data', (data) => {

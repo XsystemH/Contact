@@ -167,6 +167,12 @@ class Trainer:
     
     def validate(self, val_loader, epoch):
         """Validate the model."""
+        # DataLoader length is number of batches; if dataset is empty, len(val_loader)==0.
+        # Auto-train can hit this early when there are only a handful of labeled samples.
+        if val_loader is None or len(val_loader) == 0:
+            # Return a sentinel loss + empty metrics; caller should typically skip logging/best-model logic.
+            return float("nan"), {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
         self.model.eval()
         
         epoch_loss = 0.0
@@ -208,7 +214,11 @@ class Trainer:
                 epoch_loss += loss.item()
                 all_preds.append(contact_probs.cpu())
                 all_labels.append(contact_labels.cpu())
-        
+
+        # If no batches were produced (e.g., empty dataset), avoid division by zero / cat on empty lists.
+        if len(all_preds) == 0:
+            return float("nan"), {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
         avg_loss = epoch_loss / len(val_loader)
         
         # Compute metrics
@@ -238,7 +248,13 @@ class Trainer:
         return avg_loss, metrics
     
     def save_checkpoint(self, epoch, is_best=False):
-        """Save model checkpoint."""
+        """Save model checkpoint.
+
+        Files:
+        - checkpoint_epoch_{epoch}.pth: versioned checkpoint
+        - latest_model.pth: always overwritten to the most recently saved checkpoint
+        - best_model.pth: overwritten only when `is_best` is True (val improves, or no-val final epoch)
+        """
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -260,6 +276,14 @@ class Trainer:
         )
         torch.save(checkpoint, checkpoint_path)
         print(f"[Trainer] Saved checkpoint: {checkpoint_path}")
+
+        # Save "latest" model pointer (always updated when we save a checkpoint)
+        latest_path = os.path.join(self.config['training']['save_dir'], 'latest_model.pth')
+        try:
+            torch.save(checkpoint, latest_path)
+            print(f"[Trainer] Updated latest model: {latest_path}")
+        except Exception as e:
+            print(f"[Trainer] Warning: failed to update latest model: {e}")
         
         # Save best model
         if is_best:
@@ -296,6 +320,9 @@ class Trainer:
     def train(self, train_loader, val_loader):
         """Main training loop."""
         print(f"[Trainer] Starting training from epoch {self.start_epoch}")
+
+        has_val = (val_loader is not None) and (len(val_loader) > 0)
+        warned_no_val = False
         
         for epoch in range(self.start_epoch, self.config['training']['num_epochs']):
             # Train
@@ -305,8 +332,9 @@ class Trainer:
             print(f"\nEpoch {epoch} - Train Loss: {train_loss:.4f}")
             print(f"  Precision: {train_metrics['precision']:.4f}, Recall: {train_metrics['recall']:.4f}, F1: {train_metrics['f1']:.4f}")
             
-            # Validate
-            if epoch % self.config['validation']['val_frequency'] == 0:
+            # Validate (optional). When val split is empty, skip validation and
+            # save best_model at the final epoch so AutoTrain can reload it.
+            if has_val and epoch % self.config['validation']['val_frequency'] == 0:
                 val_loss, val_metrics = self.validate(val_loader, epoch)
                 self.val_losses.append(val_loss)
                 self.val_epochs.append(epoch + 1)
@@ -319,11 +347,21 @@ class Trainer:
                 if is_best:
                     self.best_val_loss = val_loss
                     print(f"  New best validation loss: {val_loss:.4f}")
+            elif not has_val:
+                if not warned_no_val:
+                    print("[Trainer] Warning: val split is empty (0 batches). Skipping validation.")
+                    warned_no_val = True
+                # In no-val mode, define "best" as the final epoch to ensure best_model.pth exists.
+                is_best = (epoch == self.config['training']['num_epochs'] - 1)
+                if is_best:
+                    self.best_val_loss = train_loss
+                    print(f"[Trainer] No-val mode: saving final checkpoint as best_model (train_loss={train_loss:.4f}).")
             else:
                 is_best = False
             
             # Save checkpoint
-            if epoch % self.config['training']['save_frequency'] == 0 or is_best:
+            is_last = (epoch == self.config['training']['num_epochs'] - 1)
+            if epoch % self.config['training']['save_frequency'] == 0 or is_best or is_last:
                 self.save_checkpoint(epoch, is_best)
             
             # Update learning rate
@@ -343,11 +381,42 @@ def main():
                        help='Path to config file')
     parser.add_argument('--resume', type=str, default=None,
                        help='Path to checkpoint to resume from')
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=None,
+        help=(
+            'Train for N additional epochs. '
+            'If used with --resume, will set training.num_epochs = (resume_epoch + 1 + N). '
+            'If used without --resume, will set training.num_epochs = N.'
+        ),
+    )
     args = parser.parse_args()
     
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Determine resume checkpoint path (CLI overrides config)
+    resume_path = args.resume or config.get('training', {}).get('resume_from')
+    if resume_path:
+        resume_path = _resolve_project_path(resume_path)
+
+    # If requested, translate "additional epochs" into an absolute num_epochs
+    if args.epochs is not None:
+        extra_epochs = int(args.epochs)
+        if extra_epochs <= 0:
+            raise ValueError("--epochs must be a positive integer")
+
+        if resume_path:
+            # Peek epoch from checkpoint to avoid init+load just to compute end epoch
+            ckpt = torch.load(resume_path, map_location="cpu")
+            if not isinstance(ckpt, dict) or "epoch" not in ckpt:
+                raise ValueError(f"Resume checkpoint missing 'epoch': {resume_path}")
+            base_epoch = int(ckpt["epoch"])
+            config["training"]["num_epochs"] = base_epoch + 1 + extra_epochs
+        else:
+            config["training"]["num_epochs"] = extra_epochs
 
     # Resolve run output paths relative to project root
     config['training']['save_dir'] = _resolve_project_path(config['training']['save_dir'])
@@ -433,10 +502,8 @@ def main():
     trainer = Trainer(config, device)
     
     # Resume from checkpoint if specified
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
-    elif config['training']['resume_from']:
-        trainer.load_checkpoint(config['training']['resume_from'])
+    if resume_path:
+        trainer.load_checkpoint(resume_path)
     
     # Start training
     trainer.train(train_loader, val_loader)

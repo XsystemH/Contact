@@ -1,5 +1,56 @@
 # SMPL-X Contact Prediction - Usage Guide
 
+## Quick Start（推理服务 + Web 标注器 + 复用 checkpoint）
+
+在两个终端分别启动：先起 `server.py`（ContactNet 推理服务，供标注器调用），再起 `web_interface.py`（Web 标注器，带 auto-train）。
+
+### Terminal A：启动推理服务（加载已训练 checkpoint）
+
+```bash
+cd /home/rtwang/Contact
+python server.py --config configs/260102_1.yaml --checkpoint checkpoints/260102_1/best_model.pth --host 127.0.0.1 --port 8000
+```
+
+- **`--config`**: 推理所用的模型/预处理配置（必须和 checkpoint 的模型结构一致）
+- **`--checkpoint`**: 已训练权重（`.pth`）；不指定时默认用 `config.training.save_dir/best_model.pth`
+- **`--host` / `--port`**: 服务监听地址；标注器会向该地址发送 `/predict` 和 `/reload`
+
+可用 `curl http://127.0.0.1:8000/healthz` 检查是否启动成功（注意根路径 `/` 不提供页面）。
+
+### Terminal B：启动 Web 标注器（并开启 auto-train）
+
+```bash
+cd /home/rtwang/Contact/web_convert
+python web_interface.py \
+  --source_dir /home/rtwang/Contact/data_contact_lite \
+  --target_dir /home/rtwang/Contact/_web_out \
+  --host 127.0.0.1 --port 5000 \
+  --auto_train \
+  --auto_train_every 5 \
+  --auto_train_epochs 5 \
+  --auto_train_base_config configs/260102_1.yaml \
+  --contactnet_reload_host 127.0.0.1 \
+  --contactnet_reload_port 8000
+```
+
+- **`--source_dir`**: 原始待标注数据根目录（按类别/样本子目录组织）
+- **`--target_dir`**: 标注输出目录（会写入转换后的样本与 `progress.json`，并创建 `_autotrain/`）
+- **`--host` / `--port`**: Web 标注器监听地址（浏览器访问 `http://127.0.0.1:5000`）
+- **`--auto_train`**: 开启自动训练（后台调用 `train.py`）
+- **`--auto_train_every`**: 每新增 N 个“新标注样本”（第一次生成 `contact.json`）触发一次训练
+- **`--auto_train_epochs`**: 每次触发训练，追加训练 K 个 epoch
+- **`--auto_train_base_config`**: 训练基础配置（auto-train 会自动把 `data.root_dir` 改成 `target_dir`，并把输出写到 `target_dir/_autotrain/`）
+- **`--contactnet_reload_host` / `--contactnet_reload_port`**: 训练完成后调用推理服务的 `/reload` 热加载新权重
+
+### 复用 checkpoint（让 auto-train 从已有模型继续训练）
+
+auto-train 会优先从 `target_dir/_autotrain/checkpoints/best_model.pth` 继续训练（如果存在）。因此只需把已有模型放到该位置：
+
+```bash
+mkdir -p /home/rtwang/Contact/_web_out/_autotrain/checkpoints
+cp checkpoints/260102_1/best_model.pth /home/rtwang/Contact/_web_out/_autotrain/checkpoints/best_model.pth
+```
+
 ## 项目结构
 
 ```

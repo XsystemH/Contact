@@ -51,6 +51,11 @@ except Exception:
     )
     from utils import load_json_maybe_list, write_camera_files_from_smplx_params
 
+try:
+    from .auto_train import AutoTrainManager, AutoTrainConfig
+except Exception:
+    from auto_train import AutoTrainManager, AutoTrainConfig
+
 
 app = Flask(
     __name__,
@@ -62,6 +67,80 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Thread pool for background processing
 executor = ThreadPoolExecutor(max_workers=4)
+
+# Optional auto-trainer (initialized in initialize_app)
+auto_trainer = None
+
+# ---------------------------
+# Model status helpers (viewer header)
+# ---------------------------
+
+def _basename(path: Optional[str]) -> Optional[str]:
+    try:
+        return os.path.basename(path) if path else None
+    except Exception:
+        return None
+
+
+def _contactnet_host_port() -> tuple[str, int]:
+    """Best-effort inference server address for status checks."""
+    try:
+        if auto_trainer is not None and getattr(auto_trainer, "cfg", None) is not None:
+            host = getattr(auto_trainer.cfg, "reload_host", "127.0.0.1")  # type: ignore[attr-defined]
+            port = int(getattr(auto_trainer.cfg, "reload_port", 8000))  # type: ignore[attr-defined]
+            return str(host), int(port)
+    except Exception:
+        pass
+    return "127.0.0.1", 8000
+
+
+def _fetch_contactnet_health() -> dict:
+    """Best-effort fetch from ContactNet inference server /healthz."""
+    host, port = _contactnet_host_port()
+    try:
+        conn = http.client.HTTPConnection(host, int(port), timeout=5)
+        conn.request("GET", "/healthz")
+        resp = conn.getresponse()
+        raw = resp.read()
+        if resp.status < 200 or resp.status >= 300:
+            return {"ok": False, "error": f"HTTP {resp.status}: {raw[:2000]!r}"}
+        payload = json.loads(raw.decode("utf-8"))
+        ckpt = payload.get("checkpoint")
+        return {
+            "ok": True,
+            "checkpoint": ckpt,
+            "name": _basename(ckpt) if ckpt else None,
+            "epoch": payload.get("epoch"),
+            "loaded_at": payload.get("loaded_at"),
+            "device": payload.get("device"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _get_autotrain_last_checkpoint() -> Optional[dict]:
+    try:
+        if auto_trainer is None:
+            return None
+        st = auto_trainer.get_state_snapshot()
+        last_ckpt = st.get("last_checkpoint")
+        last_best = st.get("last_best_checkpoint")
+        last_best_updated = st.get("last_best_updated")
+        return {
+            "last_checkpoint": last_ckpt,
+            "last_name": _basename(last_ckpt) if last_ckpt else None,
+            "last_ok": st.get("last_train_ok"),
+            "last_best_checkpoint": last_best,
+            "last_best_name": _basename(last_best) if last_best else None,
+            "last_best_updated": last_best_updated,
+        }
+    except Exception:
+        return None
+
+
+def _build_model_status_payload() -> dict:
+    return {"inference": _fetch_contactnet_health(), "autotrain": _get_autotrain_last_checkpoint()}
+
 
 # Global state management
 class TaskManager:
@@ -730,6 +809,26 @@ def handle_connect():
         session['user_id'] = str(uuid.uuid4())
     emit('connected', {'user_id': session['user_id']})
     emit('stats_update', task_manager.get_statistics())
+    # Send current auto-train status (if enabled)
+    try:
+        if auto_trainer is not None:
+            emit('training_status', auto_trainer.get_state_snapshot())
+    except Exception:
+        pass
+    # Send current model status (inference checkpoint + latest autotrain checkpoint)
+    try:
+        emit('model_status', _build_model_status_payload())
+    except Exception:
+        pass
+
+
+@socketio.on('request_model_status')
+def handle_request_model_status():
+    """Client requests the currently loaded inference checkpoint + latest autotrain checkpoint."""
+    try:
+        emit('model_status', _build_model_status_payload())
+    except Exception as e:
+        emit('model_status', {"inference": {"ok": False, "error": str(e)}, "autotrain": _get_autotrain_last_checkpoint()})
 
 
 @socketio.on('request_task')
@@ -909,6 +1008,11 @@ def handle_submit_decision(data):
                     from data_convert import process_single_dataset
                 
                 task = task_manager.tasks[task_id]
+
+                # Track whether this task creates a NEW labeled sample in target_dir
+                target_path = os.path.join(config['target_dir'], task['relative_path'])
+                contact_output_path = os.path.join(target_path, "contact.json")
+                contact_existed_before = os.path.exists(contact_output_path)
                 
                 # Process dataset (copy files, run camera.py, normal.py)
                 result_decision, rel_path, ratio, error = process_single_dataset(
@@ -926,8 +1030,7 @@ def handle_submit_decision(data):
                 # If manual annotation provided, override contact.json
                 if manual_annotation and not error:
                     try:
-                        target_path = os.path.join(config['target_dir'], task['relative_path'])
-                        contact_output_path = os.path.join(target_path, "contact.json")
+                        # target_path/contact_output_path already computed above
                         
                         # Load mesh data to get vertex count
                         h_verts, h_faces = load_smplx_vertices(
@@ -971,6 +1074,14 @@ def handle_submit_decision(data):
                         
             except Exception as e:
                 error_msg = str(e)
+
+            # If successful AND this is a new labeled sample, notify auto-trainer
+            try:
+                if (error_msg is None) and (not contact_existed_before) and os.path.exists(contact_output_path):
+                    if auto_trainer is not None:
+                        auto_trainer.note_new_label()
+            except Exception:
+                pass
             
             # Update task with error if any
             if error_msg:
@@ -1037,8 +1148,24 @@ def load_progress():
             print(f"Error loading progress: {e}")
 
 
-def initialize_app(source_dir, target_dir, object_dir, category=None, random_order=False, smplx_model_path=None):
+def initialize_app(
+    source_dir,
+    target_dir,
+    object_dir,
+    category=None,
+    random_order=False,
+    smplx_model_path=None,
+    *,
+    auto_train: bool = False,
+    auto_train_every: int = 20,
+    auto_train_epochs: int = 10,
+    auto_train_base_config: str = "configs/default.yaml",
+    auto_train_initial_checkpoint: Optional[str] = None,
+    contactnet_reload_host: str = "127.0.0.1",
+    contactnet_reload_port: int = 8000,
+):
     """Initialize the application with configuration."""
+    global auto_trainer
     config['source_dir'] = source_dir
     config['target_dir'] = target_dir
     config['object_dir'] = object_dir
@@ -1055,6 +1182,29 @@ def initialize_app(source_dir, target_dir, object_dir, category=None, random_ord
     
     # Load existing progress
     load_progress()
+
+    # Optional: initialize auto-trainer (single-process, best-effort)
+    if auto_train:
+        try:
+            auto_cfg = AutoTrainConfig(
+                enabled=True,
+                every_n_new_labels=int(auto_train_every),
+                additional_epochs=int(auto_train_epochs),
+                base_train_config=str(auto_train_base_config),
+                work_dir=os.path.join(target_dir, "_autotrain"),
+                initial_checkpoint=auto_train_initial_checkpoint,
+                reload_host=str(contactnet_reload_host),
+                reload_port=int(contactnet_reload_port),
+            )
+            auto_trainer = AutoTrainManager(target_dir=target_dir, cfg=auto_cfg, socketio=socketio)
+            checkpoint_info = f"initial_checkpoint={auto_cfg.initial_checkpoint}" if auto_cfg.initial_checkpoint else "auto-detect best_model.pth"
+            print(
+                f"[AutoTrain] enabled: every {auto_cfg.every_n_new_labels} new labels -> +{auto_cfg.additional_epochs} epochs; "
+                f"base_config={auto_cfg.base_train_config}; work_dir={auto_cfg.work_dir}; {checkpoint_info}"
+            )
+        except Exception as e:
+            auto_trainer = None
+            print(f"[AutoTrain] Failed to initialize: {e}")
     
     print(f"Initialized with {len(task_manager.tasks)} tasks")
     print(f"Order: {'Random' if random_order else 'By Category'}")
@@ -1095,6 +1245,13 @@ if __name__ == '__main__':
     parser.add_argument('--category', default=None, help='Optional category subfolder to process')
     parser.add_argument('--random_order', action='store_true', help='Shuffle task order')
     parser.add_argument('--smplx_model_path', default=None, help='Path to Contact/smplx_models (defaults to ../smplx_models)')
+    # Auto-train (MVP): every N NEW labeled samples -> train + reload inference server
+    parser.add_argument('--auto_train', action='store_true', help='Enable auto-training loop (every N new labels)')
+    parser.add_argument('--auto_train_every', type=int, default=20, help='Trigger auto-train after N NEW labeled samples')
+    parser.add_argument('--auto_train_epochs', type=int, default=10, help='Train for K additional epochs on each trigger')
+    parser.add_argument('--auto_train_base_config', type=str, default='configs/default.yaml', help='Base train config YAML to derive from')
+    parser.add_argument('--contactnet_reload_host', type=str, default='127.0.0.1', help='Host of ContactNet inference server for /reload')
+    parser.add_argument('--contactnet_reload_port', type=int, default=8000, help='Port of ContactNet inference server for /reload')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5000)
     args = parser.parse_args()
@@ -1106,5 +1263,11 @@ if __name__ == '__main__':
         category=args.category,
         random_order=args.random_order,
         smplx_model_path=os.path.abspath(args.smplx_model_path) if args.smplx_model_path else None,
+        auto_train=bool(args.auto_train),
+        auto_train_every=int(args.auto_train_every),
+        auto_train_epochs=int(args.auto_train_epochs),
+        auto_train_base_config=str(args.auto_train_base_config),
+        contactnet_reload_host=str(args.contactnet_reload_host),
+        contactnet_reload_port=int(args.contactnet_reload_port),
     )
     run_server(host=args.host, port=args.port)

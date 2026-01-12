@@ -5,3 +5,6 @@ smplx_models/
 __pycache__/
 data_contact/
 data_example_net/
+data_contact_lite/
+data_contact_web/
+_*/

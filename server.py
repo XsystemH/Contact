@@ -21,6 +21,8 @@ import argparse
 import os
 import tempfile
 import traceback
+import threading
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -151,10 +153,12 @@ def create_app(config_path: str, checkpoint_path: Optional[str], device_str: Opt
     app.config["CONTACT_CONFIG_PATH"] = config_path
     app.config["CONTACT_CHECKPOINT_PATH"] = resolved_ckpt
     app.config["CONTACT_CHECKPOINT_META"] = meta
+    app.config["CONTACT_LOADED_AT"] = int(time.time())
 
     app.model = model  # type: ignore[attr-defined]
     app.device = device  # type: ignore[attr-defined]
     app.preprocessor = preprocessor  # type: ignore[attr-defined]
+    app.reload_lock = threading.Lock()  # type: ignore[attr-defined]
 
     @app.get("/healthz")
     def healthz():
@@ -172,8 +176,74 @@ def create_app(config_path: str, checkpoint_path: Optional[str], device_str: Opt
                 "checkpoint": app.config["CONTACT_CHECKPOINT_PATH"],
                 "epoch": epoch,
                 "best_val_loss": best_val_loss,
+                "loaded_at": app.config.get("CONTACT_LOADED_AT"),
             }
         )
+
+    @app.post("/reload")
+    def reload_model():
+        """Hot-reload model weights (and optionally config) without restarting the process.
+
+        Body (JSON) or query params:
+          - checkpoint: path to checkpoint (.pth). If omitted, reload current checkpoint path.
+          - config: path to YAML config. If provided, will recreate model+preprocessor.
+        """
+        try:
+            payload = request.get_json(silent=True) or {}
+            ckpt_in = payload.get("checkpoint") or request.args.get("checkpoint")
+            cfg_in = payload.get("config") or request.args.get("config")
+
+            new_cfg_path = _resolve_project_path(cfg_in) if cfg_in else app.config["CONTACT_CONFIG_PATH"]
+            if not new_cfg_path or not os.path.exists(new_cfg_path):
+                raise FileNotFoundError(f"Config not found: {new_cfg_path}")
+
+            with open(new_cfg_path, "r") as f:
+                new_cfg = yaml.safe_load(f)
+
+            # If checkpoint is not specified, use best_model under config.training.save_dir
+            if ckpt_in:
+                new_ckpt_path = _resolve_project_path(str(ckpt_in))
+            else:
+                ckpt_dir = _resolve_project_path(new_cfg["training"]["save_dir"])
+                new_ckpt_path = os.path.join(ckpt_dir, "best_model.pth")
+
+            if not new_ckpt_path or not os.path.exists(new_ckpt_path):
+                raise FileNotFoundError(f"Checkpoint not found: {new_ckpt_path}")
+
+            with app.reload_lock:  # type: ignore[attr-defined]
+                # Recreate model/preprocessor if config path changed; otherwise just load weights.
+                if cfg_in:
+                    app.model = ContactNet(new_cfg).to(app.device)  # type: ignore[attr-defined]
+                    app.preprocessor = SmplContactPreprocessor(  # type: ignore[attr-defined]
+                        smplx_model_path=new_cfg["data"]["smplx_model_path"],
+                        smplx_model_type=new_cfg["data"].get("smplx_model_type", "neutral"),
+                        img_size=tuple(new_cfg["data"]["img_size"]),
+                        split="test",
+                        augment=False,
+                    )
+                    app.config["CONTACT_CONFIG_PATH"] = new_cfg_path
+
+                state_dict, meta_local = _load_checkpoint(new_ckpt_path, app.device)  # type: ignore[attr-defined]
+                app.model.load_state_dict(state_dict)  # type: ignore[attr-defined]
+                app.model.eval()  # type: ignore[attr-defined]
+
+                app.config["CONTACT_CHECKPOINT_PATH"] = new_ckpt_path
+                app.config["CONTACT_CHECKPOINT_META"] = meta_local
+                app.config["CONTACT_LOADED_AT"] = int(time.time())
+
+            return jsonify(
+                {
+                    "status": "ok",
+                    "config": app.config["CONTACT_CONFIG_PATH"],
+                    "checkpoint": app.config["CONTACT_CHECKPOINT_PATH"],
+                }
+            )
+        except Exception as e:
+            debug = request.args.get("debug", default="0") == "1"
+            payload = {"error": str(e), "type": e.__class__.__name__}
+            if debug:
+                payload["traceback"] = traceback.format_exc()
+            return jsonify(payload), 400
 
     @app.post("/predict")
     def predict():

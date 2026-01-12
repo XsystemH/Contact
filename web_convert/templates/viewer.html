@@ -297,6 +297,43 @@
             border-radius: 8px;
             border-left: 4px solid #2e7d32;
         }
+
+        .info {
+            background: #e3f2fd;
+            color: #0d47a1;
+            padding: 15px;
+            margin: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #1e88e5;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 0.85em;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.18);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            color: #fff;
+            user-select: none;
+            white-space: nowrap;
+        }
+
+        .badge .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #cfd8dc;
+        }
+
+        .badge.badge-idle .dot { background: #cfd8dc; }
+        .badge.badge-pending .dot { background: #ffca28; }
+        .badge.badge-running .dot { background: #ab47bc; }
+        .badge.badge-ok .dot { background: #66bb6a; }
+        .badge.badge-failed .dot { background: #ef5350; }
         
         @keyframes spin {
             to { transform: rotate(360deg); }
@@ -317,6 +354,27 @@
     <div class="header">
         <h1>📊 Task Viewer</h1>
         <div class="stats-bar">
+            <div class="stat-item">
+                <span>AutoTrain:</span>
+                <span id="autoTrainBadge" class="badge badge-idle" title="Auto-train status">
+                    <span class="dot"></span>
+                    <span id="autoTrainText">off</span>
+                </span>
+            </div>
+            <div class="stat-item">
+                <span>Model:</span>
+                <span id="modelBadge" class="badge badge-idle" title="ContactNet inference server loaded checkpoint">
+                    <span class="dot"></span>
+                    <span id="modelText">unknown</span>
+                </span>
+            </div>
+            <div class="stat-item">
+                <span>Latest AutoTrain:</span>
+                <span id="autoTrainModelBadge" class="badge badge-idle" title="Most recent AutoTrain best_model.pth">
+                    <span class="dot"></span>
+                    <span id="autoTrainModelText">-</span>
+                </span>
+            </div>
             <div class="stat-item">
                 <span>Total:</span>
                 <strong id="headerTotal">-</strong>

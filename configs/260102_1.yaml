@@ -9,9 +9,9 @@ data:
   num_workers: 4
   
   # Train/Val/Test split ratio (17:2:1)
-  train_ratio: 0.90  # 630/700
-  val_ratio: 0.08   # 56/700
-  test_ratio: 0.02   # 14/700
+  train_ratio: 0.80  # 630/700
+  val_ratio: 0.10   # 56/700
+  test_ratio: 0.10   # 14/700
   
   random_seed: 42
 
