@@ -283,6 +283,7 @@ class AutoTrainManager:
             return
 
         job: Optional[Dict[str, Any]] = None
+        notice: Optional[Dict[str, Any]] = None
         enqueue_only = False
         total = None
         with self._lock:
@@ -309,10 +310,22 @@ class AutoTrainManager:
             elif total > 0 and (total % int(self.small_update_freq) == 0):
                 job_type = "small"
 
-            if job_type:
+            if job_type == "small":
+                # Small update: UI hint only (do NOT train/deploy)
+                remain = int(self.big_update_freq - (total % int(self.big_update_freq)))
+                if remain == int(self.big_update_freq):
+                    remain = 0
+                notice = {
+                    "type": "small_notice",
+                    "trigger_total": int(total),
+                    "next_big_in": int(remain),
+                    "created_at": int(time.time()),
+                }
+
+            if job_type == "big":
                 recent_snapshot = list(self._state.get("recent_labeled_sample_dirs", []) or [])
                 job = {
-                    "type": job_type,
+                    "type": "big",
                     "trigger_total": int(total),
                     "created_at": int(time.time()),
                     "recent_dirs": recent_snapshot,
@@ -342,6 +355,21 @@ class AutoTrainManager:
             self._emit(self.get_state_snapshot())
         except Exception:
             pass
+
+        if notice is not None:
+            try:
+                self._emit(
+                    {
+                        "state": "notice",
+                        "job_type": "small",
+                        "trigger_total": int(notice.get("trigger_total") or 0),
+                        "next_big_in": int(notice.get("next_big_in") or 0),
+                        "small_update_freq": int(self.small_update_freq),
+                        "big_update_freq": int(self.big_update_freq),
+                    }
+                )
+            except Exception:
+                pass
 
         if job is not None:
             self.start_async(job=job)
@@ -421,13 +449,13 @@ class AutoTrainManager:
             return
 
         if job is None:
-            # Backward-compatible fallback: treat as small job at current total.
+            # Backward-compatible fallback: treat as BIG job at current total (small is UI-only).
             with self._lock:
                 total = int(self._state.get("total_annotated_images", 0))
                 recent_snapshot = list(self._state.get("recent_labeled_sample_dirs", []) or [])
-            job = {"type": "small", "trigger_total": int(total), "created_at": int(time.time()), "recent_dirs": recent_snapshot}
+            job = {"type": "big", "trigger_total": int(total), "created_at": int(time.time()), "recent_dirs": recent_snapshot}
 
-        job_type = str(job.get("type") or "small")
+        job_type = str(job.get("type") or "big")
         trigger_total = int(job.get("trigger_total") or 0)
 
         with self._lock:
@@ -484,88 +512,17 @@ class AutoTrainManager:
         latest_path = os.path.join(self.ckpt_dir, "latest_model.pth")
         prev_best_epoch = None
         next_job: Optional[Dict[str, Any]] = None
-        job_type = str(job.get("type") or "small")
+        job_type = str(job.get("type") or "big")
         trigger_total = int(job.get("trigger_total") or 0)
         try:
-            # Small-loop hyperparams
-            small_epochs = int(self.cfg.additional_epochs)
-            small_epochs = max(10, min(20, small_epochs))
-
-            subset_json_path = ""
-
             # Base derived config
             derived_cfg, resume_ckpt, cfg_dict = self._build_derived_config()
 
             train_py = os.path.join(_project_root(), "train.py")
 
-            if job_type == "small":
-                # Lower LR for quick adaptation, replay to suppress forgetting
-                base_lr = float(cfg_dict.get("training", {}).get("learning_rate", 0.0) or 0.0)
-                small_lr = float(base_lr * float(_SMALL_LR_SCALE))
-                derived_cfg, resume_ckpt, _ = self._build_derived_config(override_training={"learning_rate": small_lr})
-
-                # Build experience-replay mixed subset
-                all_dirs = _collect_labeled_sample_dirs(self.target_dir)
-                recent_dirs: Sequence[str] = job.get("recent_dirs") or []
-                new_dirs = [os.path.abspath(p) for p in list(recent_dirs)[-int(self.small_update_freq) :]]
-                new_dirs = [p for p in new_dirs if os.path.isdir(p)]
-                new_set = set(new_dirs)
-                old_pool = [d for d in all_dirs if d not in new_set]
-
-                old_k = max(30, 3 * len(new_dirs))
-                seed = trigger_total if trigger_total > 0 else int(time.time())
-                import random
-
-                rng = random.Random(int(seed))
-                if old_k >= len(old_pool):
-                    old_sample = list(old_pool)
-                else:
-                    old_sample = rng.sample(old_pool, k=int(old_k))
-
-                mixed: List[str] = []
-                seen = set()
-                for p in list(new_dirs) + list(old_sample):
-                    ap = os.path.abspath(p)
-                    if ap in seen:
-                        continue
-                    seen.add(ap)
-                    mixed.append(ap)
-
-                subset_json_path = os.path.join(self.work_dir, f"subset_small_{trigger_total or int(time.time())}.json")
-                _atomic_write_json(
-                    subset_json_path,
-                    {"sample_dirs": mixed, "new_dirs": new_dirs, "old_dirs": old_sample, "seed": int(seed)},
-                )
-
-                _log_autotrain(
-                    "ok",
-                    "small-loop replay batch built",
-                    trigger_total=trigger_total,
-                    new=len(new_dirs),
-                    old=len(old_sample),
-                    total=len(mixed),
-                    small_epochs=small_epochs,
-                    small_lr=small_lr,
-                )
-
-                cmd = [
-                    sys.executable,
-                    train_py,
-                    "--config",
-                    derived_cfg,
-                    "--epochs",
-                    str(int(small_epochs)),
-                    "--no_val",
-                    "--train_subset_json",
-                    subset_json_path,
-                ]
-                if resume_ckpt:
-                    cmd += ["--resume", resume_ckpt]
-
-            elif job_type == "big":
+            if job_type == "big":
                 # Big loop: from scratch, full dataset, full config training
                 cmd = [sys.executable, train_py, "--config", derived_cfg]
-
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -583,8 +540,6 @@ class AutoTrainManager:
                 logf.write("\n" + "=" * 80 + "\n")
                 logf.write(f"[AutoTrain] cmd: {' '.join(cmd)}\n")
                 logf.write(f"[AutoTrain] job: {job}\n")
-                if subset_json_path:
-                    logf.write(f"[AutoTrain] subset_json: {subset_json_path}\n")
                 logf.write(f"[AutoTrain] started_at: {time.ctime()}\n")
                 logf.flush()
                 proc = subprocess.run(

@@ -151,6 +151,7 @@ class TaskManager:
         self.progress = {}
         self.user_sessions = {}  # session_id -> current_task
         self.manual_annotations = {}  # task_id -> selected_faces (temporary storage)
+        self.manual_annotation_metrics = {}  # task_id -> metrics dict from manual_annotate page
         self.manual_annotation_seeds = {}  # task_id -> selected_faces (seed from current preview)
         self.latest_viz_data = {}  # task_id -> last viz_data sent to clients
         self.contactnet_tmp_dirs = {}  # task_id -> temp dir containing calibration/extrinsic
@@ -726,6 +727,7 @@ def handle_save_manual_annotation(data):
     task_id = data.get('task_id')
     selected_faces = data.get('selected_faces', [])
     hand_regions = data.get('hand_regions', {})
+    manual_metrics = data.get('metrics')
     
     if task_id is None or task_id >= len(task_manager.tasks):
         emit('annotation_saved', {'success': False, 'error': 'Invalid task ID'})
@@ -734,6 +736,8 @@ def handle_save_manual_annotation(data):
     try:
         # Store annotation temporarily for this task
         task_manager.manual_annotations[task_id] = selected_faces
+        if isinstance(manual_metrics, dict):
+            task_manager.manual_annotation_metrics[task_id] = manual_metrics
 
         # Clear any existing seed for this task
         task_manager.clear_seed_faces(task_id)
@@ -742,7 +746,7 @@ def handle_save_manual_annotation(data):
         socketio.emit('manual_annotation_received', {
             'task_id': task_id,
             'selected_faces': selected_faces,
-            'hand_regions': hand_regions
+            'hand_regions': hand_regions,
         })
         
         emit('annotation_saved', {'success': True, 'error': None})
@@ -990,6 +994,83 @@ def handle_submit_decision(data):
     decision = data['decision']  # 'accept' or 'skip'
     distance_ratio = data['distance_ratio']
     manual_annotation = data.get('manual_annotation')  # Face indices from manual annotation
+    client_metrics = data.get('metrics')
+
+    # Write metrics.jsonl (best-effort, one line per decision)
+    try:
+        task = task_manager.tasks[task_id] if task_id is not None and task_id < len(task_manager.tasks) else {}
+        rel_path = task.get('relative_path')
+        cat = task.get('category')
+        manual_m = task_manager.manual_annotation_metrics.get(task_id)
+
+        viewer_clicks = None
+        viewer_drags = None
+        viewer_zooms = None
+        viewer_interactions = None
+        viewer_duration_s = None
+        if isinstance(client_metrics, dict):
+            viewer_clicks = client_metrics.get('click_count')
+            viewer_drags = client_metrics.get('drag_count')
+            viewer_zooms = client_metrics.get('zoom_count')
+            viewer_interactions = client_metrics.get('interaction_count')
+            viewer_duration_s = client_metrics.get('duration_s')
+
+        manual_clicks = manual_m.get('click_count') if isinstance(manual_m, dict) else None
+        manual_drags = manual_m.get('drag_count') if isinstance(manual_m, dict) else None
+        manual_zooms = manual_m.get('zoom_count') if isinstance(manual_m, dict) else None
+        manual_interactions = manual_m.get('interaction_count') if isinstance(manual_m, dict) else None
+        click_total = None
+        drag_total = None
+        zoom_total = None
+        interaction_total = None
+        try:
+            if viewer_clicks is not None or manual_clicks is not None:
+                click_total = int((viewer_clicks or 0)) + int((manual_clicks or 0))
+            if viewer_drags is not None or manual_drags is not None:
+                drag_total = int((viewer_drags or 0)) + int((manual_drags or 0))
+            if viewer_zooms is not None or manual_zooms is not None:
+                zoom_total = int((viewer_zooms or 0)) + int((manual_zooms or 0))
+            if viewer_interactions is not None or manual_interactions is not None:
+                interaction_total = int((viewer_interactions or 0)) + int((manual_interactions or 0))
+        except Exception:
+            click_total = None
+            drag_total = None
+            zoom_total = None
+            interaction_total = None
+
+        metrics_path = os.path.join(config['target_dir'], 'metrics.jsonl')
+        os.makedirs(config['target_dir'], exist_ok=True)
+        row = {
+            "ts": int(time.time()),
+            "session_id": session_id,
+            "task_id": int(task_id),
+            "relative_path": rel_path,
+            "category": cat,
+            "decision": decision,
+            "distance_ratio": float(distance_ratio) if distance_ratio is not None else None,
+            "spd_seconds": float(viewer_duration_s) if viewer_duration_s is not None else None,
+            "click_count_total": click_total,
+            "click_count_viewer": viewer_clicks,
+            "click_count_manual": manual_clicks,
+            "drag_count_total": drag_total,
+            "drag_count_viewer": viewer_drags,
+            "drag_count_manual": manual_drags,
+            "zoom_count_total": zoom_total,
+            "zoom_count_viewer": viewer_zooms,
+            "zoom_count_manual": manual_zooms,
+            "interaction_count_total": interaction_total,
+            "interaction_count_viewer": viewer_interactions,
+            "interaction_count_manual": manual_interactions,
+            "used_manual_annotation": bool(manual_annotation is not None),
+            "manual_face_count": int(len(manual_annotation)) if isinstance(manual_annotation, list) else 0,
+            "metrics_viewer": client_metrics if isinstance(client_metrics, dict) else None,
+            "metrics_manual": manual_m if isinstance(manual_m, dict) else None,
+        }
+        with task_manager.lock:
+            with open(metrics_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[Metrics] Failed to write metrics.jsonl: {e}")
     
     # Mark task as completed immediately
     task_manager.complete_task(session_id, task_id, decision, distance_ratio, None)
@@ -1092,6 +1173,8 @@ def handle_submit_decision(data):
             # Clear temporary manual annotation for this task
             if task_id in task_manager.manual_annotations:
                 del task_manager.manual_annotations[task_id]
+                if task_id in task_manager.manual_annotation_metrics:
+                    del task_manager.manual_annotation_metrics[task_id]
             
             # Save progress
             save_progress()
@@ -1105,6 +1188,8 @@ def handle_submit_decision(data):
         # Clear temporary manual annotation for this task
         if task_id in task_manager.manual_annotations:
             del task_manager.manual_annotations[task_id]
+        if task_id in task_manager.manual_annotation_metrics:
+            del task_manager.manual_annotation_metrics[task_id]
         
         # Save progress for skip
         save_progress()

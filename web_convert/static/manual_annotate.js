@@ -7,6 +7,118 @@ const socket = io();
 let currentTask = null;
 let currentTaskId = null;
 
+// Metrics for manual annotation (clicks + time)
+let manualMetrics = {
+    task_id: null,
+    start_ts_ms: null,
+    end_ts_ms: null,
+    duration_s: null,
+    click_count: 0, // pure click events
+    drag_count: 0,  // orbit/drag sessions
+    zoom_count: 0,  // wheel/pinch zoom events (throttled)
+    interaction_count: 0, // derived at save
+};
+
+function _nowMs() {
+    return Date.now();
+}
+
+// Count ALL clicks on this page (face selections, brush interactions, UI buttons)
+document.addEventListener(
+    'click',
+    () => {
+        manualMetrics.click_count += 1;
+    },
+    true
+);
+
+// Drag/zoom tracking for Three.js (OrbitControls: drag rotate, wheel zoom)
+let _dragActive = false;
+let _dragMoved = false;
+let _dragStart = { x: 0, y: 0 };
+const _DRAG_THRESHOLD_PX = 6;
+let _wheelLastMs = 0;
+const _WHEEL_THROTTLE_MS = 200;
+let _pinchActive = false;
+
+function _isInThree(el) {
+    try {
+        return !!(threeContainer && el && threeContainer.contains(el));
+    } catch (e) {
+        return false;
+    }
+}
+
+document.addEventListener(
+    'pointerdown',
+    (e) => {
+        if (!_isInThree(e.target)) return;
+        _dragActive = true;
+        _dragMoved = false;
+        _dragStart = { x: e.clientX, y: e.clientY };
+    },
+    true
+);
+document.addEventListener(
+    'pointermove',
+    (e) => {
+        if (!_dragActive) return;
+        const dx = e.clientX - _dragStart.x;
+        const dy = e.clientY - _dragStart.y;
+        if (!_dragMoved && (dx * dx + dy * dy >= _DRAG_THRESHOLD_PX * _DRAG_THRESHOLD_PX)) {
+            _dragMoved = true;
+        }
+    },
+    true
+);
+document.addEventListener(
+    'pointerup',
+    () => {
+        if (_dragActive && _dragMoved) {
+            manualMetrics.drag_count += 1;
+        }
+        _dragActive = false;
+        _dragMoved = false;
+    },
+    true
+);
+
+document.addEventListener(
+    'wheel',
+    (e) => {
+        if (!_isInThree(e.target)) return;
+        const now = _nowMs();
+        if (now - _wheelLastMs >= _WHEEL_THROTTLE_MS) {
+            manualMetrics.zoom_count += 1;
+            _wheelLastMs = now;
+        }
+    },
+    true
+);
+
+document.addEventListener(
+    'touchstart',
+    (e) => {
+        if (!_isInThree(e.target)) return;
+        if (e.touches && e.touches.length >= 2) {
+            _pinchActive = true;
+        }
+    },
+    true
+);
+document.addEventListener(
+    'touchend',
+    (e) => {
+        if (!_pinchActive) return;
+        const touches = e.touches ? e.touches.length : 0;
+        if (touches < 2) {
+            manualMetrics.zoom_count += 1;
+            _pinchActive = false;
+        }
+    },
+    true
+);
+
 // Mode: 'navigate' | 'annotate' | 'brush' | 'erase'
 let mode = 'navigate';
 
@@ -793,6 +905,17 @@ socket.on('connect', () => {
 socket.on('manual_annotation_data', (data) => {
     currentTask = data.task;
     currentTaskId = data.task_id;
+
+    manualMetrics = {
+        task_id: currentTaskId,
+        start_ts_ms: _nowMs(),
+        end_ts_ms: null,
+        duration_s: null,
+        click_count: 0,
+        drag_count: 0,
+        zoom_count: 0,
+        interaction_count: 0,
+    };
     
     document.getElementById('taskPath').textContent = currentTask.relative_path;
     
@@ -912,10 +1035,16 @@ function updateStats() {
 // ============================================
 function saveAnnotation() {
     // Send annotation back to main viewer (don't navigate away)
+    manualMetrics.end_ts_ms = _nowMs();
+    if (manualMetrics.start_ts_ms != null) {
+        manualMetrics.duration_s = Math.max(0, (manualMetrics.end_ts_ms - manualMetrics.start_ts_ms) / 1000.0);
+    }
+    manualMetrics.interaction_count = (manualMetrics.click_count || 0) + (manualMetrics.drag_count || 0) + (manualMetrics.zoom_count || 0);
     const annotationData = {
         task_id: currentTaskId,
         selected_faces: Array.from(selectedFaces),
-        hand_regions: handRegionSelection
+        hand_regions: handRegionSelection,
+        metrics: manualMetrics,
     };
     
     // Emit to server to store temporarily

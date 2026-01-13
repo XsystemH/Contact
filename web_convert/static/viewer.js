@@ -8,6 +8,141 @@ let currentVizData = null;
 let manualAnnotation = null;  // Store manual annotation for current task
 let useManualAnnotation = false;  // Whether to use manual annotation instead of calculated
 
+// Per-task metrics (for SPD/ClickRate/Acceptance analytics)
+let taskMetrics = null;
+
+function _nowMs() {
+    return Date.now();
+}
+
+function resetTaskMetrics() {
+    taskMetrics = {
+        task_id: currentTaskId,
+        start_ts_ms: _nowMs(),
+        end_ts_ms: null,
+        duration_s: null,
+        // Interaction counts (viewer page only)
+        click_count: 0, // pure click events
+        drag_count: 0,  // drag/rotate sessions (count 1 per drag gesture)
+        zoom_count: 0,  // wheel/pinch zoom events (throttled)
+        interaction_count: 0, // derived at submit: click + drag + zoom
+
+        // Interaction flags/counters
+        preview_update_count: 0,
+        contactnet_run_count: 0,
+        manual_tool_opened: false,
+        manual_annotation_received: false,
+
+        // Param tracking
+        distance_ratio_initial: (distanceRatio && distanceRatio.value != null) ? String(distanceRatio.value) : null,
+        distance_ratio_changed: false,
+        contactnet_threshold_initial: (contactnetThreshold && contactnetThreshold.value != null) ? String(contactnetThreshold.value) : null,
+        contactnet_threshold_changed: false,
+    };
+}
+
+// Count ALL clicks (including Plotly and manual UI buttons)
+document.addEventListener('click', () => {
+    if (taskMetrics) taskMetrics.click_count += 1;
+}, true);
+
+// Drag/zoom tracking (Plotly view rotates via drag, zoom via wheel/pinch)
+let _dragActive = false;
+let _dragMoved = false;
+let _dragStart = { x: 0, y: 0 };
+const _DRAG_THRESHOLD_PX = 6;
+let _wheelLastMs = 0;
+const _WHEEL_THROTTLE_MS = 200;
+let _pinchActive = false;
+
+function _isInViz(el) {
+    try {
+        return !!(vizContainer && el && vizContainer.contains(el));
+    } catch (e) {
+        return false;
+    }
+}
+
+document.addEventListener(
+    'pointerdown',
+    (e) => {
+        if (!taskMetrics) return;
+        if (!_isInViz(e.target)) return;
+        _dragActive = true;
+        _dragMoved = false;
+        _dragStart = { x: e.clientX, y: e.clientY };
+    },
+    true
+);
+document.addEventListener(
+    'pointermove',
+    (e) => {
+        if (!_dragActive) return;
+        const dx = e.clientX - _dragStart.x;
+        const dy = e.clientY - _dragStart.y;
+        if (!_dragMoved && (dx * dx + dy * dy >= _DRAG_THRESHOLD_PX * _DRAG_THRESHOLD_PX)) {
+            _dragMoved = true;
+        }
+    },
+    true
+);
+document.addEventListener(
+    'pointerup',
+    () => {
+        if (!taskMetrics) {
+            _dragActive = false;
+            _dragMoved = false;
+            return;
+        }
+        if (_dragActive && _dragMoved) {
+            taskMetrics.drag_count += 1;
+        }
+        _dragActive = false;
+        _dragMoved = false;
+    },
+    true
+);
+
+document.addEventListener(
+    'wheel',
+    (e) => {
+        if (!taskMetrics) return;
+        if (!_isInViz(e.target)) return;
+        const now = _nowMs();
+        if (now - _wheelLastMs >= _WHEEL_THROTTLE_MS) {
+            taskMetrics.zoom_count += 1;
+            _wheelLastMs = now;
+        }
+    },
+    true
+);
+
+document.addEventListener(
+    'touchstart',
+    (e) => {
+        if (!taskMetrics) return;
+        if (!_isInViz(e.target)) return;
+        if (e.touches && e.touches.length >= 2) {
+            _pinchActive = true;
+        }
+    },
+    true
+);
+document.addEventListener(
+    'touchend',
+    (e) => {
+        if (!taskMetrics) return;
+        if (!_pinchActive) return;
+        // When fingers drop below 2, treat it as a pinch-zoom gesture completion.
+        const touches = e.touches ? e.touches.length : 0;
+        if (touches < 2) {
+            taskMetrics.zoom_count += 1;
+            _pinchActive = false;
+        }
+    },
+    true
+);
+
 // Elements
 const taskCategory = document.getElementById('taskCategory');
 const taskPath = document.getElementById('taskPath');
@@ -77,6 +212,15 @@ socket.on('training_status', (data) => {
                     ? `Auto-train BIG update started: ${extra} epochs (total=${total}).`
                     : `Auto-train small update started: +${extra} epochs (triggered by ${data.inflight_new_labels}/${data.every_n}, total=${total}).`,
                 'success'
+            );
+            return;
+        }
+        if (data.state === 'notice') {
+            const total = (data.trigger_total != null) ? data.trigger_total : null;
+            const nextBigIn = (data.next_big_in != null) ? data.next_big_in : null;
+            showMessage(
+                `Auto-train milestone: SMALL (${data.small_update_freq}) reached at total=${total}. Next BIG in ${nextBigIn}.`,
+                'info'
             );
             return;
         }
@@ -169,6 +313,8 @@ socket.on('task_data', (data) => {
     currentTask = data.task;
     currentTaskId = data.task_id;
     currentVizData = data.viz_data;
+
+    resetTaskMetrics();
     
     displayTask();
     displayVisualization(currentVizData);
@@ -262,6 +408,7 @@ const btnManualAnnotate = document.getElementById('btnManualAnnotate');
 if (btnManualAnnotate) {
     btnManualAnnotate.addEventListener('click', () => {
         if (currentTaskId !== null) {
+            if (taskMetrics) taskMetrics.manual_tool_opened = true;
             // Seed manual annotation using the currently displayed preview, then open page
             seedManualAnnotationFromCurrentPreview(() => {
                 window.open(`/manual_annotate?task_id=${currentTaskId}`, '_blank');
@@ -321,6 +468,7 @@ socket.on('manual_annotation_received', (data) => {
     if (data.task_id === currentTaskId) {
         manualAnnotation = data.selected_faces;
         useManualAnnotation = true;
+        if (taskMetrics) taskMetrics.manual_annotation_received = true;
         showMessage(`Manual annotation received! ${manualAnnotation.length} faces selected. Click Accept to save, or Update Preview to recalculate.`, 'success');
         
         // Update visualization to show manual annotation
@@ -412,6 +560,7 @@ function requestNextTask() {
 }
 
 function updateVisualization() {
+    if (taskMetrics) taskMetrics.preview_update_count += 1;
     const ratio = parseFloat(distanceRatio.value);
     if (isNaN(ratio) || ratio < 0.01 || ratio > 3.0) {
         showMessage('Distance ratio must be between 0.01 and 3.0', 'error');
@@ -432,6 +581,7 @@ function updateVisualization() {
 }
 
 function runContactNet() {
+    if (taskMetrics) taskMetrics.contactnet_run_count += 1;
     if (currentTaskId === null) {
         showMessage('No task loaded. Please load a task first.', 'error');
         return;
@@ -465,6 +615,13 @@ function runContactNet() {
 
 function submitDecision(decision) {
     const ratio = parseFloat(distanceRatio.value);
+
+    // Finalize per-task metrics
+    if (taskMetrics) {
+        taskMetrics.end_ts_ms = _nowMs();
+        taskMetrics.duration_s = Math.max(0, (taskMetrics.end_ts_ms - taskMetrics.start_ts_ms) / 1000.0);
+        taskMetrics.interaction_count = (taskMetrics.click_count || 0) + (taskMetrics.drag_count || 0) + (taskMetrics.zoom_count || 0);
+    }
     
     disableControls();
     showMessage(`Submitting decision: ${decision}...`, 'info');
@@ -474,6 +631,19 @@ function submitDecision(decision) {
         decision: decision,
         distance_ratio: ratio
     };
+
+    if (taskMetrics) {
+        // Param change detection (also computed here to be robust)
+        const curRatio = (distanceRatio && distanceRatio.value != null) ? String(distanceRatio.value) : null;
+        if (taskMetrics.distance_ratio_initial !== null && curRatio !== null && curRatio !== taskMetrics.distance_ratio_initial) {
+            taskMetrics.distance_ratio_changed = true;
+        }
+        const curTh = (contactnetThreshold && contactnetThreshold.value != null) ? String(contactnetThreshold.value) : null;
+        if (taskMetrics.contactnet_threshold_initial !== null && curTh !== null && curTh !== taskMetrics.contactnet_threshold_initial) {
+            taskMetrics.contactnet_threshold_changed = true;
+        }
+        payload.metrics = taskMetrics;
+    }
     
     // Include manual annotation if active
     if (useManualAnnotation && manualAnnotation) {
@@ -481,6 +651,26 @@ function submitDecision(decision) {
     }
     
     socket.emit('submit_decision', payload);
+}
+
+// Mark parameter changes early (not just on submit)
+if (distanceRatio) {
+    distanceRatio.addEventListener('input', () => {
+        if (!taskMetrics) return;
+        const v = String(distanceRatio.value);
+        if (taskMetrics.distance_ratio_initial !== null && v !== taskMetrics.distance_ratio_initial) {
+            taskMetrics.distance_ratio_changed = true;
+        }
+    });
+}
+if (contactnetThreshold) {
+    contactnetThreshold.addEventListener('input', () => {
+        if (!taskMetrics) return;
+        const v = String(contactnetThreshold.value);
+        if (taskMetrics.contactnet_threshold_initial !== null && v !== taskMetrics.contactnet_threshold_initial) {
+            taskMetrics.contactnet_threshold_changed = true;
+        }
+    });
 }
 
 function displayTask() {
