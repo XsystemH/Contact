@@ -55,45 +55,63 @@ socket.on('training_status', (data) => {
         const badge = document.getElementById('autoTrainBadge');
         const txt = document.getElementById('autoTrainText');
 
-        function setBadge(kind, text) {
+        function setBadge(kind, text, title) {
             if (!badge || !txt) return;
             badge.classList.remove('badge-idle', 'badge-pending', 'badge-running', 'badge-ok', 'badge-failed');
             badge.classList.add(`badge-${kind}`);
             txt.textContent = text;
+            if (typeof title === 'string') {
+                badge.title = title;
+            }
         }
 
         if (data.state === 'started') {
-            setBadge('running', `running (+${data.additional_epochs})`);
+            const jt = data.job_type || 'small';
+            const total = (data.trigger_total != null) ? data.trigger_total : null;
+            const extra = data.additional_epochs;
+            const label = jt === 'big' ? `big (epochs=${extra})` : `small (+${extra})`;
+            const title = `job=${jt}\ntrigger_total=${total}`;
+            setBadge('running', `running ${label}`, title);
             showMessage(
-                `Auto-train started: +${data.additional_epochs} epochs (triggered by ${data.inflight_new_labels}/${data.every_n} new labels).`,
+                jt === 'big'
+                    ? `Auto-train BIG update started: ${extra} epochs (total=${total}).`
+                    : `Auto-train small update started: +${extra} epochs (triggered by ${data.inflight_new_labels}/${data.every_n}, total=${total}).`,
                 'success'
             );
             return;
         }
         if (data.state === 'finished') {
-            setBadge('ok', `ok (${Math.round((data.duration_s || 0))}s)`);
-            showMessage(`Auto-train finished. Inference server reloaded.`, 'success');
+            const jt = data.job_type || 'small';
+            const total = (data.trigger_total != null) ? data.trigger_total : null;
+            setBadge('ok', `ok (${Math.round((data.duration_s || 0))}s)`, `job=${jt}\ntrigger_total=${total}`);
+            showMessage(`Auto-train ${jt.toUpperCase()} finished. Inference server reloaded.`, 'success');
             socket.emit('request_model_status');
             return;
         }
         if (data.state === 'failed') {
-            setBadge('failed', `failed`);
-            showMessage(`Auto-train failed: ${data.error || 'Unknown error'}`, 'error');
+            const jt = data.job_type || 'small';
+            const total = (data.trigger_total != null) ? data.trigger_total : null;
+            setBadge('failed', `failed`, `job=${jt}\ntrigger_total=${total}`);
+            showMessage(`Auto-train ${jt.toUpperCase()} failed: ${data.error || 'Unknown error'}`, 'error');
             return;
         }
         // Snapshot
         if (!data.enabled) {
-            setBadge('idle', 'off');
+            setBadge('idle', 'off', 'Auto-train disabled');
             return;
         }
         const pending = data.pending_new_labels || 0;
-        const everyN = data.every_n_new_labels || data.every_n || '-';
+        const everyN = data.small_update_freq || data.every_n_new_labels || data.every_n || '-';
+        const total = data.total_annotated_images || null;
+        const queued = data.queued_jobs_len || 0;
+        const bigN = data.big_update_freq || '-';
+        const title = `total=${total}\nqueued=${queued}\nsmall_freq=${everyN}\nbig_freq=${bigN}`;
         if (data.running) {
-            setBadge('running', 'running');
+            setBadge('running', 'running', title);
         } else if (pending > 0) {
-            setBadge('pending', `${pending}/${everyN}`);
+            setBadge('pending', `${pending}/${everyN}`, title);
         } else {
-            setBadge('idle', `on (0/${everyN})`);
+            setBadge('idle', `on (0/${everyN})`, title);
         }
     } catch (e) {
         // no-op

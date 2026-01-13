@@ -230,8 +230,17 @@ class SmplContactDataset(Dataset):
             ...
     """
     
-    def __init__(self, root_dir, smplx_model_path, smplx_model_type='neutral',
-                 img_size=(512, 512), split='train', augment=False, indices=None):
+    def __init__(
+        self,
+        root_dir,
+        smplx_model_path,
+        smplx_model_type='neutral',
+        img_size=(512, 512),
+        split='train',
+        augment=False,
+        indices=None,
+        sample_dirs=None,
+    ):
         """
         Args:
             root_dir: Root directory of dataset
@@ -263,14 +272,39 @@ class SmplContactDataset(Dataset):
         # Get SMPL-X faces for normal computation
         self.faces = torch.from_numpy(self.smplx_model.faces.astype(np.int64))
         
-        # Collect all sample paths
-        all_samples = self._collect_samples()
-        
-        # Filter by indices if provided
-        if indices is not None:
-            self.samples = [all_samples[i] for i in indices if i < len(all_samples)]
+        # Collect all sample paths (either full scan, or explicit subset)
+        if sample_dirs is not None:
+            required_files = [
+                'image.jpg',
+                'smplx_parameters.json',
+                'contact.json',
+                'box_annotation.json',
+                'calibration.json',
+                'extrinsic.json'
+            ]
+            samples = []
+            for d in list(sample_dirs):
+                if d is None:
+                    continue
+                sample_path = os.path.abspath(str(d))
+                if not os.path.isdir(sample_path):
+                    continue
+                if not all(os.path.exists(os.path.join(sample_path, f)) for f in required_files):
+                    continue
+
+                # Best-effort parse category/id from .../<category>/<id>
+                sample_id = os.path.basename(sample_path)
+                category = os.path.basename(os.path.dirname(sample_path))
+                samples.append({'path': sample_path, 'category': category, 'id': sample_id})
+            self.samples = samples
         else:
-            self.samples = all_samples
+            all_samples = self._collect_samples()
+
+            # Filter by indices if provided
+            if indices is not None:
+                self.samples = [all_samples[i] for i in indices if i < len(all_samples)]
+            else:
+                self.samples = all_samples
 
         # Fail-fast: mask file is required by the model (do NOT silently skip samples)
         self._validate_object_masks()

@@ -20,11 +20,18 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import yaml
 
+
+# Defaults (can be overridden via base_train_config YAML: autotrain.small_update_freq / big_update_freq)
+_DEFAULT_SMALL_UPDATE_FREQ = 10
+_DEFAULT_BIG_UPDATE_FREQ = 80
+
+# Small-loop defaults (epochs via AutoTrainConfig.additional_epochs; LR scale here)
+_SMALL_LR_SCALE = 0.2
 
 def _project_root() -> str:
     # Contact/web_convert/auto_train.py -> Contact/
@@ -45,6 +52,38 @@ def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def _collect_labeled_sample_dirs(root_dir: str) -> List[str]:
+    """Collect labeled sample directories under root_dir (absolute paths).
+
+    Mirrors SmplContactDataset._collect_samples() / split_dataset() required-files filtering.
+    """
+    root_dir = os.path.abspath(root_dir)
+    required_files = [
+        "image.jpg",
+        "smplx_parameters.json",
+        "contact.json",
+        "box_annotation.json",
+        "calibration.json",
+        "extrinsic.json",
+    ]
+
+    out: List[str] = []
+    if not os.path.isdir(root_dir):
+        return out
+
+    for category in sorted(os.listdir(root_dir)):
+        category_path = os.path.join(root_dir, category)
+        if not os.path.isdir(category_path):
+            continue
+        for sample_id in sorted(os.listdir(category_path)):
+            sample_path = os.path.join(category_path, sample_id)
+            if not os.path.isdir(sample_path):
+                continue
+            if all(os.path.exists(os.path.join(sample_path, f)) for f in required_files):
+                out.append(os.path.abspath(sample_path))
+    return out
 
 
 class _Ansi:
@@ -82,8 +121,10 @@ def _log_autotrain(level: str, msg: str, **kv: Any) -> None:
 @dataclass
 class AutoTrainConfig:
     enabled: bool = False
-    every_n_new_labels: int = 20
-    additional_epochs: int = 10
+    # Kept for backward compatibility (viewer progress bar), but the scheduler reads frequencies from YAML config.
+    every_n_new_labels: int = _DEFAULT_SMALL_UPDATE_FREQ
+    # Used as "small update epochs" (clamped to 10..20 for responsiveness).
+    additional_epochs: int = 15
     base_train_config: str = "configs/default.yaml"
     # Where to write derived config + logs + checkpoints
     work_dir: Optional[str] = None  # default: <target_dir>/_autotrain
@@ -117,6 +158,58 @@ class AutoTrainManager:
         self.viz_dir = os.path.join(self.work_dir, "visualizations")
 
         self._state = self._load_state()
+        self.small_update_freq, self.big_update_freq = self._load_scheduler_freqs()
+        self._reconcile_state_with_disk()
+
+    def _load_scheduler_freqs(self) -> Tuple[int, int]:
+        """Load SMALL/BIG update frequencies from base_train_config YAML."""
+        small = int(_DEFAULT_SMALL_UPDATE_FREQ)
+        big = int(_DEFAULT_BIG_UPDATE_FREQ)
+        try:
+            base_cfg_path = _resolve_project_path(self.cfg.base_train_config)
+            if os.path.exists(base_cfg_path):
+                with open(base_cfg_path, "r", encoding="utf-8") as f:
+                    cfg_dict = yaml.safe_load(f) or {}
+                if isinstance(cfg_dict, dict):
+                    at = cfg_dict.get("autotrain", {}) or {}
+                    if isinstance(at, dict):
+                        if at.get("small_update_freq") is not None:
+                            small = int(at["small_update_freq"])
+                        if at.get("big_update_freq") is not None:
+                            big = int(at["big_update_freq"])
+        except Exception:
+            # fallback to defaults
+            pass
+
+        # Basic validation
+        if small <= 0:
+            small = int(_DEFAULT_SMALL_UPDATE_FREQ)
+        if big <= 0:
+            big = int(_DEFAULT_BIG_UPDATE_FREQ)
+        if big < small:
+            # keep big meaningful; fallback
+            big = int(_DEFAULT_BIG_UPDATE_FREQ)
+        return small, big
+
+    def _reconcile_state_with_disk(self) -> None:
+        """Best-effort reconcile counters with what exists on disk.
+
+        This prevents schedule drift after process restarts (state.json may be missing/stale).
+        """
+        try:
+            disk_dirs = _collect_labeled_sample_dirs(self.target_dir)
+            disk_total = int(len(disk_dirs))
+            with self._lock:
+                cur_total = int(self._state.get("total_annotated_images", 0) or 0)
+                if disk_total > cur_total:
+                    self._state["total_annotated_images"] = disk_total
+                keep = int(self.small_update_freq)
+                if not isinstance(self._state.get("recent_labeled_sample_dirs"), list) or not self._state.get("recent_labeled_sample_dirs"):
+                    self._state["recent_labeled_sample_dirs"] = disk_dirs[-keep:]
+                self._save_state()
+        except Exception:
+            # Best-effort only
+            return
 
     def _emit(self, payload: Dict[str, Any]) -> None:
         # Best-effort broadcast (viewer.js will show toast messages)
@@ -127,23 +220,40 @@ class AutoTrainManager:
             pass
 
     def _load_state(self) -> Dict[str, Any]:
-        if os.path.exists(self.state_path):
-            try:
-                with open(self.state_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                pass
-        return {
+        default_state: Dict[str, Any] = {
+            # Legacy counters kept for compatibility
             "pending_new_labels": 0,
             "inflight_new_labels": 0,
+            # Hybrid scheduler state
+            "total_annotated_images": 0,
+            "recent_labeled_sample_dirs": [],
+            "queued_jobs": [],
+            "last_job_type": None,
+            "last_job_trigger_total": None,
+            # Train bookkeeping
             "last_train_started_at": None,
             "last_train_finished_at": None,
             "last_train_ok": None,
             "last_error": None,
             "last_checkpoint": None,
         }
+
+        if os.path.exists(self.state_path):
+            try:
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for k, v in default_state.items():
+                        data.setdefault(k, v)
+                    # Basic type normalization
+                    if not isinstance(data.get("recent_labeled_sample_dirs"), list):
+                        data["recent_labeled_sample_dirs"] = []
+                    if not isinstance(data.get("queued_jobs"), list):
+                        data["queued_jobs"] = []
+                    return data
+            except Exception:
+                pass
+        return default_state
 
     def _save_state(self) -> None:
         _atomic_write_json(self.state_path, self._state)
@@ -157,30 +267,75 @@ class AutoTrainManager:
             snap = dict(self._state)
             snap["running"] = bool(self._running)
             snap["enabled"] = bool(self.cfg.enabled)
-            snap["every_n_new_labels"] = int(self.cfg.every_n_new_labels)
+            # Backward-compatible fields (viewer.js expects these)
+            snap["every_n_new_labels"] = int(self.small_update_freq)
             snap["additional_epochs"] = int(self.cfg.additional_epochs)
+            # Hybrid scheduler fields
+            snap["small_update_freq"] = int(self.small_update_freq)
+            snap["big_update_freq"] = int(self.big_update_freq)
+            snap["queued_jobs_len"] = int(len(self._state.get("queued_jobs", []) or []))
+            snap["small_lr_scale"] = float(_SMALL_LR_SCALE)
         return snap
 
-    def note_new_label(self) -> None:
+    def note_new_label(self, *, sample_dir: Optional[str] = None) -> None:
         """Called when a NEW labeled sample is created (first-time contact.json for that sample)."""
         if not self.cfg.enabled:
             return
 
-        should_start = False
-        pending = None
+        job: Optional[Dict[str, Any]] = None
+        enqueue_only = False
+        total = None
         with self._lock:
-            self._state["pending_new_labels"] = int(self._state.get("pending_new_labels", 0)) + 1
-            pending = int(self._state["pending_new_labels"])
-            self._save_state()
-            should_start = (not self._running) and (int(self._state["pending_new_labels"]) >= int(self.cfg.every_n_new_labels))
+            # 1) Update global total
+            self._state["total_annotated_images"] = int(self._state.get("total_annotated_images", 0)) + 1
+            total = int(self._state["total_annotated_images"])
 
-        _log_autotrain(
-            "warn" if pending and pending >= int(self.cfg.every_n_new_labels) else "ok",
-            "new label recorded",
-            pending=pending,
-            trigger_every=int(self.cfg.every_n_new_labels),
-            add_epochs=int(self.cfg.additional_epochs),
-        )
+            # 2) Update recent FIFO for "recent 10"
+            if sample_dir:
+                sdir = os.path.abspath(sample_dir)
+                recent = list(self._state.get("recent_labeled_sample_dirs", []) or [])
+                recent.append(sdir)
+                if len(recent) > int(self.small_update_freq):
+                    recent = recent[-int(self.small_update_freq) :]
+                self._state["recent_labeled_sample_dirs"] = recent
+
+            # 3) Backward-compatible progress counter (0..SMALL_UPDATE_FREQ-1)
+            self._state["pending_new_labels"] = int(total % int(self.small_update_freq))
+
+            # 4) Decide trigger type (big has priority)
+            job_type: Optional[str] = None
+            if total > 0 and (total % int(self.big_update_freq) == 0):
+                job_type = "big"
+            elif total > 0 and (total % int(self.small_update_freq) == 0):
+                job_type = "small"
+
+            if job_type:
+                recent_snapshot = list(self._state.get("recent_labeled_sample_dirs", []) or [])
+                job = {
+                    "type": job_type,
+                    "trigger_total": int(total),
+                    "created_at": int(time.time()),
+                    "recent_dirs": recent_snapshot,
+                }
+
+                if self._running:
+                    q = list(self._state.get("queued_jobs", []) or [])
+                    q.append(job)
+                    self._state["queued_jobs"] = q
+                    enqueue_only = True
+                    job = None
+
+            self._save_state()
+
+        if enqueue_only:
+            _log_autotrain(
+                "warn",
+                "new label recorded (queued job while running)",
+                total=total,
+                queued=int(len(self._state.get("queued_jobs", []) or [])),
+            )
+        else:
+            _log_autotrain("ok", "new label recorded", total=total, next_job=(job.get("type") if job else None))
 
         # Push a lightweight snapshot to clients so the UI badge stays up-to-date
         try:
@@ -188,11 +343,13 @@ class AutoTrainManager:
         except Exception:
             pass
 
-        if should_start:
-            self.start_async()
+        if job is not None:
+            self.start_async(job=job)
 
-    def _build_derived_config(self) -> Tuple[str, str]:
-        """Return (derived_config_path, resume_checkpoint_path_or_empty)."""
+    def _build_derived_config(
+        self, *, override_training: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Return (derived_config_path, resume_checkpoint_path_or_empty, derived_cfg_dict)."""
         base_cfg_path = _resolve_project_path(self.cfg.base_train_config)
         if not os.path.exists(base_cfg_path):
             raise FileNotFoundError(f"Base train config not found: {base_cfg_path}")
@@ -216,6 +373,12 @@ class AutoTrainManager:
         if base_cfg.get("visualization", {}).get("enabled"):
             base_cfg["visualization"]["save_dir"] = self.viz_dir
 
+        # Optional overrides (used for small-loop hyperparams)
+        if override_training:
+            base_cfg.setdefault("training", {})
+            for k, v in override_training.items():
+                base_cfg["training"][k] = v
+
         os.makedirs(self.work_dir, exist_ok=True)
         os.makedirs(self.ckpt_dir, exist_ok=True)
         os.makedirs(self.viz_dir, exist_ok=True)
@@ -237,8 +400,8 @@ class AutoTrainManager:
             auto_resume = os.path.join(self.ckpt_dir, "best_model.pth")
             if os.path.exists(auto_resume):
                 resume = auto_resume
-        
-        return self.derived_config_path, resume
+
+        return self.derived_config_path, resume, base_cfg
 
     def _reload_inference_server(self, checkpoint_path: str) -> None:
         import http.client
@@ -253,27 +416,47 @@ class AutoTrainManager:
         if resp.status < 200 or resp.status >= 300:
             raise RuntimeError(f"/reload failed: HTTP {resp.status}: {raw[:2000]!r}")
 
-    def start_async(self) -> None:
+    def start_async(self, *, job: Optional[Dict[str, Any]] = None) -> None:
         if not self.cfg.enabled:
             return
+
+        if job is None:
+            # Backward-compatible fallback: treat as small job at current total.
+            with self._lock:
+                total = int(self._state.get("total_annotated_images", 0))
+                recent_snapshot = list(self._state.get("recent_labeled_sample_dirs", []) or [])
+            job = {"type": "small", "trigger_total": int(total), "created_at": int(time.time()), "recent_dirs": recent_snapshot}
+
+        job_type = str(job.get("type") or "small")
+        trigger_total = int(job.get("trigger_total") or 0)
 
         with self._lock:
             if self._running:
                 return
             self._running = True
-            inflight = int(self._state.get("pending_new_labels", 0))
+            # UI compatibility: show a full bar (inflight/every_n == 1.0)
+            self._state["inflight_new_labels"] = int(self.big_update_freq if job_type == "big" else self.small_update_freq)
             self._state["pending_new_labels"] = 0
-            self._state["inflight_new_labels"] = inflight
+            self._state["last_job_type"] = job_type
+            self._state["last_job_trigger_total"] = trigger_total
             self._state["last_train_started_at"] = int(time.time())
             self._state["last_error"] = None
             self._save_state()
 
+        # Compute message-friendly epochs for UI (small: additional; big: full num_epochs)
+        ui_epochs = int(self.cfg.additional_epochs)
+        try:
+            if job_type == "big":
+                _, _, cfg_dict = self._build_derived_config()
+                ui_epochs = int(cfg_dict.get("training", {}).get("num_epochs", ui_epochs))
+        except Exception:
+            pass
+
         _log_autotrain(
             "run",
             "training started",
-            inflight=inflight,
-            trigger_every=int(self.cfg.every_n_new_labels),
-            add_epochs=int(self.cfg.additional_epochs),
+            job_type=job_type,
+            trigger_total=trigger_total,
             base_config=self.cfg.base_train_config,
             work_dir=self.work_dir,
             reload=f"{self.cfg.reload_host}:{int(self.cfg.reload_port)}",
@@ -282,36 +465,109 @@ class AutoTrainManager:
         self._emit(
             {
                 "state": "started",
-                "inflight_new_labels": inflight,
-                "every_n": int(self.cfg.every_n_new_labels),
-                "additional_epochs": int(self.cfg.additional_epochs),
+                "job_type": job_type,
+                "trigger_total": trigger_total,
+                "inflight_new_labels": int(self.big_update_freq if job_type == "big" else self.small_update_freq),
+                "every_n": int(self.big_update_freq if job_type == "big" else self.small_update_freq),
+                "additional_epochs": int(ui_epochs),
             }
         )
 
-        t = threading.Thread(target=self._run_train_job, daemon=True)
+        t = threading.Thread(target=self._run_train_job, kwargs={"job": job}, daemon=True)
         t.start()
 
-    def _run_train_job(self) -> None:
+    def _run_train_job(self, *, job: Dict[str, Any]) -> None:
         ok = False
         err: Optional[str] = None
         started_at = time.time()
         best_path = os.path.join(self.ckpt_dir, "best_model.pth")
         latest_path = os.path.join(self.ckpt_dir, "latest_model.pth")
         prev_best_epoch = None
+        next_job: Optional[Dict[str, Any]] = None
+        job_type = str(job.get("type") or "small")
+        trigger_total = int(job.get("trigger_total") or 0)
         try:
-            derived_cfg, resume_ckpt = self._build_derived_config()
+            # Small-loop hyperparams
+            small_epochs = int(self.cfg.additional_epochs)
+            small_epochs = max(10, min(20, small_epochs))
+
+            subset_json_path = ""
+
+            # Base derived config
+            derived_cfg, resume_ckpt, cfg_dict = self._build_derived_config()
 
             train_py = os.path.join(_project_root(), "train.py")
-            cmd = [
-                sys.executable,
-                train_py,
-                "--config",
-                derived_cfg,
-                "--epochs",
-                str(int(self.cfg.additional_epochs)),
-            ]
-            if resume_ckpt:
-                cmd += ["--resume", resume_ckpt]
+
+            if job_type == "small":
+                # Lower LR for quick adaptation, replay to suppress forgetting
+                base_lr = float(cfg_dict.get("training", {}).get("learning_rate", 0.0) or 0.0)
+                small_lr = float(base_lr * float(_SMALL_LR_SCALE))
+                derived_cfg, resume_ckpt, _ = self._build_derived_config(override_training={"learning_rate": small_lr})
+
+                # Build experience-replay mixed subset
+                all_dirs = _collect_labeled_sample_dirs(self.target_dir)
+                recent_dirs: Sequence[str] = job.get("recent_dirs") or []
+                new_dirs = [os.path.abspath(p) for p in list(recent_dirs)[-int(self.small_update_freq) :]]
+                new_dirs = [p for p in new_dirs if os.path.isdir(p)]
+                new_set = set(new_dirs)
+                old_pool = [d for d in all_dirs if d not in new_set]
+
+                old_k = max(30, 3 * len(new_dirs))
+                seed = trigger_total if trigger_total > 0 else int(time.time())
+                import random
+
+                rng = random.Random(int(seed))
+                if old_k >= len(old_pool):
+                    old_sample = list(old_pool)
+                else:
+                    old_sample = rng.sample(old_pool, k=int(old_k))
+
+                mixed: List[str] = []
+                seen = set()
+                for p in list(new_dirs) + list(old_sample):
+                    ap = os.path.abspath(p)
+                    if ap in seen:
+                        continue
+                    seen.add(ap)
+                    mixed.append(ap)
+
+                subset_json_path = os.path.join(self.work_dir, f"subset_small_{trigger_total or int(time.time())}.json")
+                _atomic_write_json(
+                    subset_json_path,
+                    {"sample_dirs": mixed, "new_dirs": new_dirs, "old_dirs": old_sample, "seed": int(seed)},
+                )
+
+                _log_autotrain(
+                    "ok",
+                    "small-loop replay batch built",
+                    trigger_total=trigger_total,
+                    new=len(new_dirs),
+                    old=len(old_sample),
+                    total=len(mixed),
+                    small_epochs=small_epochs,
+                    small_lr=small_lr,
+                )
+
+                cmd = [
+                    sys.executable,
+                    train_py,
+                    "--config",
+                    derived_cfg,
+                    "--epochs",
+                    str(int(small_epochs)),
+                    "--no_val",
+                    "--train_subset_json",
+                    subset_json_path,
+                ]
+                if resume_ckpt:
+                    cmd += ["--resume", resume_ckpt]
+
+            elif job_type == "big":
+                # Big loop: from scratch, full dataset, full config training
+                cmd = [sys.executable, train_py, "--config", derived_cfg]
+
+            else:
+                raise ValueError(f"Unknown job type: {job_type}")
 
             # Snapshot best epoch before training (for "did best update?" signal)
             try:
@@ -326,6 +582,9 @@ class AutoTrainManager:
             with open(self.log_path, "a", encoding="utf-8") as logf:
                 logf.write("\n" + "=" * 80 + "\n")
                 logf.write(f"[AutoTrain] cmd: {' '.join(cmd)}\n")
+                logf.write(f"[AutoTrain] job: {job}\n")
+                if subset_json_path:
+                    logf.write(f"[AutoTrain] subset_json: {subset_json_path}\n")
                 logf.write(f"[AutoTrain] started_at: {time.ctime()}\n")
                 logf.flush()
                 proc = subprocess.run(
@@ -370,31 +629,31 @@ class AutoTrainManager:
                 self._state["last_checkpoint"] = latest_path if ok else self._state.get("last_checkpoint")
                 self._state["last_best_checkpoint"] = best_path if ok else self._state.get("last_best_checkpoint")
                 self._state["last_best_updated"] = best_updated
-                # If failed, restore inflight labels back to pending so it can be retried later.
-                inflight = int(self._state.get("inflight_new_labels", 0))
                 self._state["inflight_new_labels"] = 0
-                if not ok and inflight > 0:
-                    self._state["pending_new_labels"] = int(self._state.get("pending_new_labels", 0)) + inflight
                 self._save_state()
 
-                # Optional: auto-chain if new labels arrived while training
-                should_chain = (
-                    ok
-                    and int(self._state.get("pending_new_labels", 0)) >= int(self.cfg.every_n_new_labels)
-                    and self.cfg.enabled
-                )
+                # Optional: auto-chain next queued job (only after a successful run)
+                if ok and self.cfg.enabled:
+                    q = list(self._state.get("queued_jobs", []) or [])
+                    if q:
+                        next_job = q.pop(0)
+                        self._state["queued_jobs"] = q
+                        self._save_state()
 
             self._emit(
                 {
                     "state": "finished" if ok else "failed",
                     "ok": bool(ok),
+                    "job_type": job_type,
+                    "trigger_total": trigger_total,
                     "checkpoint": latest_path if ok else None,
                     "best_checkpoint": best_path if ok else None,
                     "best_updated": best_updated if ok else None,
                     "error": err,
                     "log_path": self.log_path,
                     "duration_s": duration_s,
-                    "pending_new_labels": int(self._state.get("pending_new_labels", 0)),
+                    "total_annotated_images": int(self._state.get("total_annotated_images", 0)),
+                    "queued_jobs_len": int(len(self._state.get("queued_jobs", []) or [])),
                 }
             )
 
@@ -410,6 +669,15 @@ class AutoTrainManager:
             else:
                 _log_autotrain("err", "training failed", duration_s=duration_s, error=err, log=self.log_path)
 
-            if should_chain:
-                self.start_async()
+            if ok and next_job is not None:
+                try:
+                    _log_autotrain(
+                        "run",
+                        "chaining queued job",
+                        next_type=str(next_job.get("type")),
+                        queued_left=int(len(self._state.get("queued_jobs", []) or [])),
+                    )
+                    self.start_async(job=next_job)
+                except Exception:
+                    pass
 

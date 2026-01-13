@@ -77,3 +77,8 @@ visualization:
   save_frequency: 10  # Save visualizations every N epochs (set to higher value to reduce I/O overhead)
 # Device
 device: "cuda"  # cuda or cpu
+
+# Auto-train (Hybrid Scheduler)
+autotrain:
+  small_update_freq: 10
+  big_update_freq: 80

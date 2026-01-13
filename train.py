@@ -382,6 +382,17 @@ def main():
     parser.add_argument('--resume', type=str, default=None,
                        help='Path to checkpoint to resume from')
     parser.add_argument(
+        '--train_subset_json',
+        type=str,
+        default=None,
+        help='Optional JSON file to train on a subset. Format: {"sample_dirs": ["/abs/sample_dir", ...]}.',
+    )
+    parser.add_argument(
+        '--no_val',
+        action='store_true',
+        help='Disable validation (useful for small/fast online updates).',
+    )
+    parser.add_argument(
         '--epochs',
         type=int,
         default=None,
@@ -429,55 +440,113 @@ def main():
     
     # Create datasets
     print("Loading datasets...")
-    
-    # Split into train/val/test indices
-    train_indices, val_indices, test_indices = split_dataset(
-        config['data']['root_dir'],
-        train_ratio=config['data']['train_ratio'],
-        val_ratio=config['data']['val_ratio'],
-        test_ratio=config['data']['test_ratio'],
-        seed=config['data']['random_seed']
-    )
 
-    # Persist split indices alongside checkpoints
-    save_dataset_splits(
-        config['training']['save_dir'],
-        train_indices,
-        val_indices,
-        test_indices,
-        meta={
-            'root_dir': config['data']['root_dir'],
-            'train_ratio': config['data']['train_ratio'],
-            'val_ratio': config['data']['val_ratio'],
-            'test_ratio': config['data']['test_ratio'],
-            'random_seed': config['data']['random_seed'],
-        }
-    )
-    
-    # Create datasets with respective indices
-    train_dataset = SmplContactDataset(
-        root_dir=config['data']['root_dir'],
-        smplx_model_path=config['data']['smplx_model_path'],
-        smplx_model_type=config['data']['smplx_model_type'],
-        img_size=tuple(config['data']['img_size']),
-        split='train',
-        augment=True,
-        indices=train_indices
-    )
-    
-    val_dataset = SmplContactDataset(
-        root_dir=config['data']['root_dir'],
-        smplx_model_path=config['data']['smplx_model_path'],
-        smplx_model_type=config['data']['smplx_model_type'],
-        img_size=tuple(config['data']['img_size']),
-        split='val',
-        augment=False,
-        indices=val_indices
-    )
-    
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
-    print(f"Test samples: {len(test_indices)}")
+    # Optional: train on explicit subset (experience replay / online updates)
+    if args.train_subset_json:
+        subset_path = _resolve_project_path(str(args.train_subset_json))
+        with open(subset_path, "r", encoding="utf-8") as f:
+            subset_payload = json.load(f)
+        if isinstance(subset_payload, dict):
+            sample_dirs = subset_payload.get("sample_dirs", [])
+        elif isinstance(subset_payload, list):
+            sample_dirs = subset_payload
+        else:
+            raise ValueError(f"--train_subset_json must be a dict or list, got: {type(subset_payload)}")
+
+        sample_dirs = [os.path.abspath(str(p)) for p in list(sample_dirs)]
+        if len(sample_dirs) == 0:
+            raise ValueError(f"--train_subset_json contains 0 sample_dirs: {subset_path}")
+
+        # Optionally create a small val split from the subset (unless --no_val)
+        if args.no_val:
+            train_dirs = sample_dirs
+            val_dirs = []
+        else:
+            rng = np.random.RandomState(int(config["data"]["random_seed"]))
+            perm = rng.permutation(len(sample_dirs))
+            n_train = max(1, int(len(sample_dirs) * float(config["data"]["train_ratio"])))
+            train_idx = perm[:n_train]
+            val_idx = perm[n_train:]
+            train_dirs = [sample_dirs[int(i)] for i in train_idx]
+            val_dirs = [sample_dirs[int(i)] for i in val_idx]
+
+        train_dataset = SmplContactDataset(
+            root_dir=config['data']['root_dir'],
+            smplx_model_path=config['data']['smplx_model_path'],
+            smplx_model_type=config['data']['smplx_model_type'],
+            img_size=tuple(config['data']['img_size']),
+            split='train',
+            augment=True,
+            sample_dirs=train_dirs,
+        )
+
+        val_dataset = None
+        if (not args.no_val) and len(val_dirs) > 0:
+            val_dataset = SmplContactDataset(
+                root_dir=config['data']['root_dir'],
+                smplx_model_path=config['data']['smplx_model_path'],
+                smplx_model_type=config['data']['smplx_model_type'],
+                img_size=tuple(config['data']['img_size']),
+                split='val',
+                augment=False,
+                sample_dirs=val_dirs,
+            )
+
+        print(f"Train samples (subset): {len(train_dataset)}")
+        print(f"Val samples (subset): {len(val_dataset) if val_dataset is not None else 0}")
+
+        test_indices = []
+
+    else:
+        # Full dataset mode
+        train_indices, val_indices, test_indices = split_dataset(
+            config['data']['root_dir'],
+            train_ratio=config['data']['train_ratio'],
+            val_ratio=config['data']['val_ratio'],
+            test_ratio=config['data']['test_ratio'],
+            seed=config['data']['random_seed']
+        )
+
+        # Persist split indices alongside checkpoints
+        save_dataset_splits(
+            config['training']['save_dir'],
+            train_indices,
+            val_indices,
+            test_indices,
+            meta={
+                'root_dir': config['data']['root_dir'],
+                'train_ratio': config['data']['train_ratio'],
+                'val_ratio': config['data']['val_ratio'],
+                'test_ratio': config['data']['test_ratio'],
+                'random_seed': config['data']['random_seed'],
+            }
+        )
+
+        train_dataset = SmplContactDataset(
+            root_dir=config['data']['root_dir'],
+            smplx_model_path=config['data']['smplx_model_path'],
+            smplx_model_type=config['data']['smplx_model_type'],
+            img_size=tuple(config['data']['img_size']),
+            split='train',
+            augment=True,
+            indices=train_indices
+        )
+
+        val_dataset = None
+        if not args.no_val:
+            val_dataset = SmplContactDataset(
+                root_dir=config['data']['root_dir'],
+                smplx_model_path=config['data']['smplx_model_path'],
+                smplx_model_type=config['data']['smplx_model_type'],
+                img_size=tuple(config['data']['img_size']),
+                split='val',
+                augment=False,
+                indices=val_indices
+            )
+
+        print(f"Train samples: {len(train_dataset)}")
+        print(f"Val samples: {len(val_dataset) if val_dataset is not None else 0}")
+        print(f"Test samples: {len(test_indices)}")
     
     # Create data loaders
     train_loader = DataLoader(
@@ -489,14 +558,16 @@ def main():
         pin_memory=True
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        num_workers=config['data']['num_workers'],
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
+    val_loader = None
+    if val_dataset is not None and len(val_dataset) > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['training']['batch_size'],
+            shuffle=False,
+            num_workers=config['data']['num_workers'],
+            collate_fn=collate_fn,
+            pin_memory=True
+        )
     
     # Initialize trainer
     trainer = Trainer(config, device)
@@ -504,6 +575,17 @@ def main():
     # Resume from checkpoint if specified
     if resume_path:
         trainer.load_checkpoint(resume_path)
+        # Ensure the currently requested learning rate (e.g., small-loop LR) takes effect.
+        desired_lr = float(config['training']['learning_rate'])
+        for g in trainer.optimizer.param_groups:
+            g['lr'] = desired_lr
+            # Some schedulers rely on initial_lr for state_dict roundtrips
+            g['initial_lr'] = desired_lr
+        if trainer.scheduler is not None and hasattr(trainer.scheduler, "base_lrs"):
+            try:
+                trainer.scheduler.base_lrs = [desired_lr for _ in trainer.optimizer.param_groups]
+            except Exception:
+                pass
     
     # Start training
     trainer.train(train_loader, val_loader)

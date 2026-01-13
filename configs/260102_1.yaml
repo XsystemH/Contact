@@ -78,3 +78,8 @@ visualization:
   
 # Device
 device: "cuda"  # cuda or cpu
+
+# Auto-train (Hybrid Scheduler)
+autotrain:
+  small_update_freq: 10
+  big_update_freq: 80

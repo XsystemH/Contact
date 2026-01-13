@@ -1079,7 +1079,8 @@ def handle_submit_decision(data):
             try:
                 if (error_msg is None) and (not contact_existed_before) and os.path.exists(contact_output_path):
                     if auto_trainer is not None:
-                        auto_trainer.note_new_label()
+                        # Pass the absolute sample dir so auto-train can track "recent 10" precisely.
+                        auto_trainer.note_new_label(sample_dir=target_path)
             except Exception:
                 pass
             
